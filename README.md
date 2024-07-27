@@ -54,7 +54,7 @@ We do not have any breaking database changes since beta.1, and do not plan any i
 Reth [v0.2.0-beta.1](https://github.com/paradigmxyz/reth/releases/tag/v0.2.0-beta.1) includes
 a [set of breaking database changes](https://github.com/paradigmxyz/reth/pull/5191) that makes it impossible to use database files produced by earlier versions.
 
-If you had a database produced by alpha versions of Reth, you need to drop it with `reth db drop`
+If you had a database produced by alpha versions of reth, you need to drop it with `reth db drop`
 (using the same arguments such as `--config` or `--datadir` that you passed to `reth node`), and resync using the same `reth node` command you've used before.
 
 ## For Users
