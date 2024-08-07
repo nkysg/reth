@@ -74,6 +74,7 @@ pub struct EthereumAddOns;
 
 impl<N: FullNodeComponents> NodeAddOns<N> for EthereumAddOns {
     type EthApi = EthApi<N::Provider, N::Pool, NetworkHandle, N::Evm>;
+    type ExtArgs = ();
 }
 
 impl<N> Node<N> for EthereumNode

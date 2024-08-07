@@ -53,6 +53,7 @@ impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
                 hooks: NodeHooks::default(),
                 rpc: RpcAddOns { _eth_api: PhantomData::<()>, hooks: RpcHooks::default() },
                 exexs: Vec::new(),
+                ext_args: Default::default(),
             },
         }
     }
@@ -182,6 +183,7 @@ where
                 hooks: NodeHooks::default(),
                 rpc: RpcAddOns { _eth_api: PhantomData::<AO::EthApi>, hooks: RpcHooks::default() },
                 exexs: Vec::new(),
+                ext_args: Default::default(),
             },
         }
     }
@@ -250,6 +252,12 @@ where
         E: Future<Output = eyre::Result<()>> + Send,
     {
         self.add_ons.exexs.push((exex_id.into(), Box::new(exex)));
+        self
+    }
+
+    /// update the extent args
+    pub fn update_ext_args(mut self, args: AO::ExtArgs) -> Self {
+        self.add_ons.ext_args = args;
         self
     }
 

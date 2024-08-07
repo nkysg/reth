@@ -108,6 +108,7 @@ pub struct OptimismAddOns;
 
 impl<N: FullNodeComponents> NodeAddOns<N> for OptimismAddOns {
     type EthApi = OpEthApi<N>;
+    type ExtArgs = Option<String>;
 }
 
 /// A regular optimism evm and executor builder.

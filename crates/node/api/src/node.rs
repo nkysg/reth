@@ -156,10 +156,13 @@ pub trait NodeAddOns<N: FullNodeComponents>: Send + Sync + Unpin + Clone + 'stat
     /// The core `eth` namespace API type to install on the RPC server (see
     /// `reth_rpc_eth_api::EthApiServer`).
     type EthApi: Send + Clone;
+    /// The extent arguments required for the node add-ons.
+    type ExtArgs: Send + Clone + Default;
 }
 
 impl<N: FullNodeComponents> NodeAddOns<N> for () {
     type EthApi = ();
+    type ExtArgs = ();
 }
 
 /// Returns the builder for type.

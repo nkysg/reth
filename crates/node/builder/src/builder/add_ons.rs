@@ -16,6 +16,8 @@ pub struct AddOns<Node: FullNodeComponents, AddOns: NodeAddOns<Node>> {
     pub exexs: Vec<(String, Box<dyn BoxedLaunchExEx<Node>>)>,
     /// Additional RPC add-ons.
     pub rpc: RpcAddOns<Node, AddOns::EthApi>,
+    /// Additional node add-ons args.
+    pub ext_args: AddOns::ExtArgs,
 }
 
 /// Captures node specific addons that can be installed on top of the type configured node and are

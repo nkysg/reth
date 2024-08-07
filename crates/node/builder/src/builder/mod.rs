@@ -440,6 +440,11 @@ where
         }
     }
 
+    /// Sets the endpoint for the sequencer http client.
+    pub fn update_ext_args(self, args: AO::ExtArgs) -> Self {
+        Self { builder: self.builder.update_ext_args(args), task_executor: self.task_executor }
+    }
+
     /// Launches the node with the given launcher.
     pub async fn launch_with<L>(self, launcher: L) -> eyre::Result<L::Node>
     where
