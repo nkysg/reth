@@ -1,7 +1,7 @@
 // re-export the node api types
 pub use reth_node_api::{FullNodeTypes, NodeTypes};
 
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::Arc;
 
 use reth_chainspec::ChainSpec;
 use reth_node_api::FullNodeComponents;
@@ -35,47 +35,6 @@ pub trait Node<N: FullNodeTypes>: NodeTypes + Clone {
 
     /// Returns a [`NodeComponentsBuilder`] for the node.
     fn components_builder(&self) -> Self::ComponentsBuilder;
-}
-
-/// A [`Node`] type builder
-#[derive(Clone, Default, Debug)]
-pub struct AnyNode<N = (), C = (), AO = ()>(PhantomData<(N, AO)>, C);
-
-impl<N, C> AnyNode<N, C> {
-    /// Configures the types of the node.
-    pub fn types<T>(self) -> AnyNode<T, C> {
-        AnyNode::<T, C>(PhantomData::<(T, ())>, self.1)
-    }
-
-    /// Sets the node components builder.
-    pub const fn components_builder<T>(&self, value: T) -> AnyNode<N, T> {
-        AnyNode::<N, T>(PhantomData::<(N, ())>, value)
-    }
-}
-
-impl<N, C, AO> NodeTypes for AnyNode<N, C, AO>
-where
-    N: FullNodeTypes,
-    C: Send + Sync + Unpin + 'static,
-    AO: Send + Sync + Unpin + Clone + 'static,
-{
-    type Primitives = N::Primitives;
-
-    type Engine = N::Engine;
-}
-
-impl<N, C, AO> Node<N> for AnyNode<N, C, AO>
-where
-    N: FullNodeTypes + Clone,
-    C: NodeComponentsBuilder<N> + Clone + Sync + Unpin + 'static,
-    AO: NodeAddOns<NodeAdapter<N, C::Components>>,
-{
-    type ComponentsBuilder = C;
-    type AddOns = AO;
-
-    fn components_builder(&self) -> Self::ComponentsBuilder {
-        self.1.clone()
-    }
 }
 
 /// The launched node with all components including RPC handlers.
