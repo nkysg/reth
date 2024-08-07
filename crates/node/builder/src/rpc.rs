@@ -335,7 +335,6 @@ where
 /// Provides builder for the core `eth` API type.
 pub trait EthApiBuilderProvider<N: FullNodeComponents>: BuilderProvider<N> {
     /// Returns the eth api builder.
-    #[allow(clippy::type_complexity)]
     fn eth_api_builder() -> Box<dyn Fn(&EthApiBuilderCtx<N>) -> Self + Send>;
 }
 

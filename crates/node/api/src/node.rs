@@ -168,7 +168,6 @@ pub trait BuilderProvider<N: FullNodeComponents>: Send {
     type Ctx<'a>;
 
     /// Returns builder for type.
-    #[allow(clippy::type_complexity)]
     fn builder() -> Box<dyn for<'a> Fn(Self::Ctx<'a>) -> Self + Send>;
 }
 
