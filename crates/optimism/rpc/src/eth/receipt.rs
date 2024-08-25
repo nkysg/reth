@@ -19,7 +19,7 @@ where
 {
     #[inline]
     fn cache(&self) -> &EthStateCache {
-        self.inner.cache()
+        self.inner.0.cache()
     }
 
     async fn build_transaction_receipt(

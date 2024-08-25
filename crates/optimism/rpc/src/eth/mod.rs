@@ -6,11 +6,13 @@ pub mod transaction;
 mod block;
 mod call;
 mod pending_block;
+pub mod rpc;
 
 use std::{fmt, sync::Arc};
 
+use crate::eth::rpc::SequencerClient;
 use alloy_primitives::U256;
-use derive_more::Deref;
+use derive_more::{Deref, DerefMut};
 use op_alloy_network::Optimism;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
@@ -56,10 +58,10 @@ pub type EthApiNodeBackend<N> = EthApiInner<
 ///
 /// This type implements the [`FullEthApi`](reth_rpc_eth_api::helpers::FullEthApi) by implemented
 /// all the `Eth` helper traits and prerequisite traits.
-#[derive(Clone, Deref)]
+#[derive(Clone, Deref, DerefMut)]
 pub struct OpEthApi<N: FullNodeComponents> {
     #[deref]
-    inner: Arc<EthApiNodeBackend<N>>,
+    inner: Arc<(EthApiNodeBackend<N>, Option<SequencerClient>)>,
 }
 
 impl<N: FullNodeComponents> OpEthApi<N> {
@@ -81,11 +83,10 @@ impl<N: FullNodeComponents> OpEthApi<N> {
             ctx.new_fee_history_cache(),
             ctx.evm_config.clone(),
             ctx.executor.clone(),
-            None,
             ctx.config.proof_permits,
         );
 
-        Self { inner: Arc::new(inner) }
+        Self { inner: Arc::new((inner, None)) }
     }
 }
 
@@ -108,22 +109,22 @@ where
         &self,
     ) -> impl ChainSpecProvider<ChainSpec = ChainSpec> + BlockNumReader + StageCheckpointReader
     {
-        self.inner.provider()
+        self.inner.0.provider()
     }
 
     #[inline]
     fn network(&self) -> impl NetworkInfo {
-        self.inner.network()
+        self.inner.0.network()
     }
 
     #[inline]
     fn starting_block(&self) -> U256 {
-        self.inner.starting_block()
+        self.inner.0.starting_block()
     }
 
     #[inline]
     fn signers(&self) -> &parking_lot::RwLock<Vec<Box<dyn EthSigner>>> {
-        self.inner.signers()
+        self.inner.0.signers()
     }
 }
 
@@ -134,17 +135,17 @@ where
 {
     #[inline]
     fn io_task_spawner(&self) -> impl TaskSpawner {
-        self.inner.task_spawner()
+        self.inner.0.task_spawner()
     }
 
     #[inline]
     fn tracing_task_pool(&self) -> &BlockingTaskPool {
-        self.inner.blocking_task_pool()
+        self.inner.0.blocking_task_pool()
     }
 
     #[inline]
     fn tracing_task_guard(&self) -> &BlockingTaskGuard {
-        self.inner.blocking_task_guard()
+        self.inner.0.blocking_task_guard()
     }
 }
 
@@ -157,22 +158,22 @@ where
     fn provider(
         &self,
     ) -> impl BlockIdReader + HeaderProvider + ChainSpecProvider<ChainSpec = ChainSpec> {
-        self.inner.provider()
+        self.inner.0.provider()
     }
 
     #[inline]
     fn cache(&self) -> &EthStateCache {
-        self.inner.cache()
+        self.inner.0.cache()
     }
 
     #[inline]
     fn gas_oracle(&self) -> &GasPriceOracle<impl BlockReaderIdExt> {
-        self.inner.gas_oracle()
+        self.inner.0.gas_oracle()
     }
 
     #[inline]
     fn fee_history_cache(&self) -> &FeeHistoryCache {
-        self.inner.fee_history_cache()
+        self.inner.0.fee_history_cache()
     }
 }
 
@@ -183,17 +184,17 @@ where
 {
     #[inline]
     fn provider(&self) -> impl StateProviderFactory + ChainSpecProvider<ChainSpec = ChainSpec> {
-        self.inner.provider()
+        self.inner.0.provider()
     }
 
     #[inline]
     fn cache(&self) -> &EthStateCache {
-        self.inner.cache()
+        self.inner.0.cache()
     }
 
     #[inline]
     fn pool(&self) -> impl TransactionPool {
-        self.inner.pool()
+        self.inner.0.pool()
     }
 }
 
@@ -204,7 +205,7 @@ where
 {
     #[inline]
     fn max_proof_window(&self) -> u64 {
-        self.inner.eth_proof_window()
+        self.inner.0.eth_proof_window()
     }
 }
 
@@ -222,7 +223,7 @@ where
 {
     #[inline]
     fn evm_config(&self) -> &impl ConfigureEvm {
-        self.inner.evm_config()
+        self.inner.0.evm_config()
     }
 }
 

@@ -28,12 +28,12 @@ where
 {
     #[inline]
     fn call_gas_limit(&self) -> u64 {
-        self.inner.gas_cap()
+        self.inner.0.gas_cap()
     }
 
     #[inline]
     fn evm_config(&self) -> &impl ConfigureEvm {
-        self.inner.evm_config()
+        self.inner.0.evm_config()
     }
 
     fn create_txn_env(

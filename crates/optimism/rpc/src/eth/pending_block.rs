@@ -31,22 +31,22 @@ where
            + EvmEnvProvider
            + ChainSpecProvider<ChainSpec = ChainSpec>
            + StateProviderFactory {
-        self.inner.provider()
+        self.inner.0.provider()
     }
 
     #[inline]
     fn pool(&self) -> impl TransactionPool {
-        self.inner.pool()
+        self.inner.0.pool()
     }
 
     #[inline]
     fn pending_block(&self) -> &tokio::sync::Mutex<Option<PendingBlock>> {
-        self.inner.pending_block()
+        self.inner.0.pending_block()
     }
 
     #[inline]
     fn evm_config(&self) -> &impl ConfigureEvm {
-        self.inner.evm_config()
+        self.inner.0.evm_config()
     }
 
     /// Returns the locally built pending block

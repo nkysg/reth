@@ -23,7 +23,7 @@ where
 {
     #[inline]
     fn provider(&self) -> impl HeaderProvider {
-        self.inner.provider()
+        self.inner.0.provider()
     }
 
     async fn block_receipts(
@@ -83,11 +83,11 @@ where
 {
     #[inline]
     fn provider(&self) -> impl BlockReaderIdExt {
-        self.inner.provider()
+        self.inner.0.provider()
     }
 
     #[inline]
     fn cache(&self) -> &EthStateCache {
-        self.inner.cache()
+        self.inner.0.cache()
     }
 }
