@@ -7908,7 +7908,6 @@ dependencies = [
  "clap",
  "eyre",
  "jsonrpsee",
- "jsonrpsee-types",
  "parking_lot 0.12.3",
  "reqwest",
  "reth",
@@ -8033,7 +8032,6 @@ name = "reth-optimism-rpc"
 version = "1.0.5"
 dependencies = [
  "alloy-primitives",
- "derive_more 1.0.0",
  "jsonrpsee",
  "jsonrpsee-types",
  "op-alloy-network",
@@ -8058,6 +8056,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8462,6 +8461,7 @@ dependencies = [
  "jsonrpsee",
  "jsonrpsee-types",
  "parking_lot 0.12.3",
+ "reqwest",
  "reth-chainspec",
  "reth-errors",
  "reth-evm",
@@ -8479,6 +8479,8 @@ dependencies = [
  "revm",
  "revm-inspectors",
  "revm-primitives",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
 ]

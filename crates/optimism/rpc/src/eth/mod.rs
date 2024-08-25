@@ -10,7 +10,6 @@ mod pending_block;
 use std::{fmt, sync::Arc};
 
 use alloy_primitives::U256;
-use derive_more::Deref;
 use op_alloy_network::Optimism;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
@@ -25,7 +24,7 @@ use reth_rpc::eth::{core::EthApiInner, DevSigner};
 use reth_rpc_eth_api::{
     helpers::{
         AddDevSigners, EthApiSpec, EthFees, EthSigner, EthState, LoadBlock, LoadFee, LoadState,
-        SpawnBlocking, Trace,
+        SequencerClient, SpawnBlocking, Trace,
     },
     EthApiTypes,
 };
@@ -56,10 +55,10 @@ pub type EthApiNodeBackend<N> = EthApiInner<
 ///
 /// This type implements the [`FullEthApi`](reth_rpc_eth_api::helpers::FullEthApi) by implemented
 /// all the `Eth` helper traits and prerequisite traits.
-#[derive(Clone, Deref)]
+#[derive(Clone)]
 pub struct OpEthApi<N: FullNodeComponents> {
-    #[deref]
     inner: Arc<EthApiNodeBackend<N>>,
+    sequencer_client: Option<Arc<SequencerClient>>,
 }
 
 impl<N: FullNodeComponents> OpEthApi<N> {
@@ -81,11 +80,10 @@ impl<N: FullNodeComponents> OpEthApi<N> {
             ctx.new_fee_history_cache(),
             ctx.evm_config.clone(),
             ctx.executor.clone(),
-            None,
             ctx.config.proof_permits,
         );
 
-        Self { inner: Arc::new(inner) }
+        Self { inner: Arc::new(inner), sequencer_client: None }
     }
 }
 

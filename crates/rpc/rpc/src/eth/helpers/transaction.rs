@@ -3,9 +3,8 @@
 use std::sync::Arc;
 
 use reth_provider::{BlockReaderIdExt, TransactionsProvider};
-use reth_rpc_eth_api::{
-    helpers::{EthSigner, EthTransactions, LoadTransaction, SpawnBlocking},
-    RawTransactionForwarder,
+use reth_rpc_eth_api::helpers::{
+    EthSigner, EthTransactions, LoadTransaction, SequencerClient, SpawnBlocking,
 };
 use reth_rpc_eth_types::EthStateCache;
 use reth_transaction_pool::TransactionPool;
@@ -22,11 +21,6 @@ where
     #[inline]
     fn provider(&self) -> impl BlockReaderIdExt {
         self.inner.provider()
-    }
-
-    #[inline]
-    fn raw_tx_forwarder(&self) -> Option<Arc<dyn RawTransactionForwarder>> {
-        self.inner.raw_tx_forwarder()
     }
 
     #[inline]
@@ -58,6 +52,9 @@ where
     fn pool(&self) -> &Self::Pool {
         self.inner.pool()
     }
+
+    #[inline]
+    fn set_sequencer_client(&mut self, _sequencer_client: Arc<SequencerClient>) {}
 }
 
 #[cfg(test)]
@@ -98,7 +95,6 @@ mod tests {
             BlockingTaskPool::build().expect("failed to build tracing pool"),
             fee_history_cache,
             evm_config,
-            None,
             DEFAULT_PROOF_PERMITS,
         );
 

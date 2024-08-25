@@ -21,6 +21,8 @@ pub mod error;
 pub mod fee;
 pub mod pending_block;
 pub mod receipt;
+mod rpc;
+pub use rpc::{SequencerClient, SequencerRpcError};
 pub mod signer;
 pub mod spec;
 pub mod state;
@@ -37,7 +39,7 @@ pub use signer::{AddDevSigners, EthSigner};
 pub use spec::EthApiSpec;
 pub use state::{EthState, LoadState};
 pub use trace::Trace;
-pub use transaction::{EthTransactions, LoadTransaction, UpdateRawTxForwarder};
+pub use transaction::{EthTransactions, LoadTransaction};
 
 use crate::EthApiTypes;
 
