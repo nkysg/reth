@@ -3,6 +3,8 @@ use serde::Serialize;
 
 use reth_primitives::{Account, Address, Buf};
 
+const ADDRESS_LEN: usize = 20;
+
 /// Account as it is saved in the database.
 ///
 /// [`Address`] is the subkey.
@@ -31,15 +33,15 @@ impl Compact for AccountBeforeTx {
         if let Some(account) = self.info {
             acc_len = account.to_compact(buf);
         }
-        acc_len + 20
+        acc_len + ADDRESS_LEN
     }
 
     fn from_compact(mut buf: &[u8], len: usize) -> (Self, &[u8]) {
-        let address = Address::from_slice(&buf[..20]);
-        buf.advance(20);
+        let address = Address::from_slice(&buf[..ADDRESS_LEN]);
+        buf.advance(ADDRESS_LEN);
 
-        let info = if len - 20 > 0 {
-            let (acc, advanced_buf) = Account::from_compact(buf, len - 20);
+        let info = if len - ADDRESS_LEN > 0 {
+            let (acc, advanced_buf) = Account::from_compact(buf, len - ADDRESS_LEN);
             buf = advanced_buf;
             Some(acc)
         } else {

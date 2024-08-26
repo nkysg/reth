@@ -81,6 +81,7 @@ impl Decode for BlockNumberAddress {
 )]
 pub struct AddressStorageKey(pub (Address, StorageKey));
 
+// XXX FIXME replace 52 with 20 + 32
 impl Encode for AddressStorageKey {
     type Encoded = [u8; 52];
 
