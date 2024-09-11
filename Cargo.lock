@@ -8694,6 +8694,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "derive_more",
+ "reth-codecs",
  "reth-fs-util",
  "reth-primitives",
 ]

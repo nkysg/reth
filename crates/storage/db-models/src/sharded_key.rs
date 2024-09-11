@@ -1,6 +1,6 @@
 //! Sharded key
-use crate::{
-    table::{Decode, Encode},
+use reth_codec::{
+    Decode, Encode},
     DatabaseError,
 };
 use reth_primitives::BlockNumber;
