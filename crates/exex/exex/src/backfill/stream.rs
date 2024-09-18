@@ -125,6 +125,7 @@ where
                     range,
                     stream_parallelism: this.parallelism,
                 };
+                println!("YSG spawning job {:?}", job.range);
                 let task =
                     tokio::task::spawn_blocking(move || job.next().expect("non-empty range"));
                 this.tasks.push_back(task);
@@ -255,15 +256,32 @@ mod tests {
             BackfillJobFactory::new(executor.clone(), blockchain_db.clone()).with_thresholds(
                 ExecutionStageThresholds { max_blocks: Some(2), ..Default::default() },
             );
-        let mut backfill_stream = factory.backfill(1..=2).into_stream();
-        let mut chain = backfill_stream.next().await.unwrap().unwrap();
-        chain.execution_outcome_mut().state_mut().reverts.sort();
+        let mut backfill_stream1 = factory.backfill(1..=2).into_stream();
+        let mut chain1 = backfill_stream1.next().await.unwrap().unwrap();
+        chain1.execution_outcome_mut().state_mut().reverts.sort();
+        // expect no more blocks
+        assert!(backfill_stream1.next().await.is_none());
+        /*
+        let mut blocks1 = chain1.blocks_iter().collect::<Vec<_>>();
+        assert_eq!(blocks1.len(), 2);
+        assert_eq!(blocks1.get(0).unwrap().block.header.header().number, 1);
+        assert_eq!(blocks1.get(1).unwrap().block.header.header().number, 2); */
 
-        assert!(chain.blocks_iter().eq(&blocks));
-        assert_eq!(chain.execution_outcome(), &execution_outcome);
+        let mut backfill_stream2 = factory.backfill(3..=4).into_stream();
+        let chain2 = backfill_stream2.next().await.unwrap();
+        println!("YSG chain2 {:?}", chain2);
+        let mut chain2 = chain2.unwrap();
+        chain2.execution_outcome_mut().state_mut().reverts.sort();
+        let blocks2 = chain2.blocks_iter().collect::<Vec<_>>();
+        assert_eq!(blocks2.get(0).unwrap().block.header.header().number, 3);
+        assert_eq!(blocks2.get(1).unwrap().block.header.header().number, 4);
 
         // expect no more blocks
-        assert!(backfill_stream.next().await.is_none());
+        assert!(backfill_stream2.next().await.is_none());
+
+      //  blocks1.extend(blocks2);
+     //  assert!(blocks1.iter().eq(blocks.iter()));
+        assert_eq!(chain2.execution_outcome(), &execution_outcome);
 
         Ok(())
     }

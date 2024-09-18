@@ -39,6 +39,7 @@ where
     type Item = Result<Chain, BlockExecutionError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        println!("YSG next {:?}", self.range);
         if self.range.is_empty() {
             return None
         }
@@ -66,6 +67,7 @@ where
         let mut executor = self.executor.batch_executor(StateProviderDatabase::new(
             self.provider.history_by_block_number(self.range.start().saturating_sub(1))?,
         ));
+        println!("YSG execute_range");
         executor.set_prune_modes(self.prune_modes.clone());
 
         let mut fetch_block_duration = Duration::default();
@@ -78,6 +80,7 @@ where
             // Fetch the block
             let fetch_block_start = Instant::now();
 
+            println!("yesg block number {}", block_number);
             let td = self
                 .provider
                 .header_td_by_number(block_number)?
@@ -88,7 +91,7 @@ where
                 .provider
                 .sealed_block_with_senders(block_number.into(), TransactionVariant::WithHash)?
                 .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?;
-
+            println!("yesg block number {} XXX", block_number);
             fetch_block_duration += fetch_block_start.elapsed();
 
             cumulative_gas += block.gas_used;
@@ -115,6 +118,8 @@ where
             execution_duration += execute_start.elapsed();
 
             // TODO(alexey): report gas metrics using `block.header.gas_used`
+
+            println!("YSG get block");
 
             // Seal the block back and save it
             blocks.push(block.seal(hash));

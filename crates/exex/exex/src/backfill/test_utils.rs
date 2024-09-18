@@ -88,7 +88,7 @@ where
 fn blocks(
     chain_spec: Arc<ChainSpec>,
     key_pair: Keypair,
-) -> eyre::Result<(BlockWithSenders, BlockWithSenders)> {
+) -> eyre::Result<(BlockWithSenders, BlockWithSenders, BlockWithSenders, BlockWithSenders)> {
     // First block has a transaction that transfers some ETH to zero address
     let block1 = Block {
         header: Header {
@@ -149,7 +149,65 @@ fn blocks(
     .with_recovered_senders()
     .ok_or_eyre("failed to recover senders")?;
 
-    Ok((block1, block2))
+    let block3 = Block {
+        header: Header {
+            parent_hash: block1.header.hash_slow(),
+            receipts_root: b256!(
+                "d3a6acf9a244d78b33831df95d472c4128ea85bf079a1d41e32ed0b7d2244c9e"
+            ),
+            difficulty: chain_spec.fork(EthereumHardfork::Paris).ttd().expect("Paris TTD"),
+            number: 3,
+            gas_limit: MIN_TRANSACTION_GAS,
+            gas_used: MIN_TRANSACTION_GAS,
+            ..Default::default()
+        },
+        body: vec![sign_tx_with_key_pair(
+            key_pair,
+            Transaction::Eip2930(TxEip2930 {
+                chain_id: chain_spec.chain.id(),
+                nonce: 2,
+                gas_limit: MIN_TRANSACTION_GAS as u128,
+                gas_price: 1_500_000_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(0.1 * ETH_TO_WEI as f64),
+                ..Default::default()
+            }),
+        )],
+        ..Default::default()
+    }
+        .with_recovered_senders()
+        .ok_or_eyre("failed to recover senders")?;
+
+    let block4 = Block {
+        header: Header {
+            parent_hash: block1.header.hash_slow(),
+            receipts_root: b256!(
+                "d3a6acf9a244d78b33831df95d472c4128ea85bf079a1d41e32ed0b7d2244c9e"
+            ),
+            difficulty: chain_spec.fork(EthereumHardfork::Paris).ttd().expect("Paris TTD"),
+            number: 4,
+            gas_limit: MIN_TRANSACTION_GAS,
+            gas_used: MIN_TRANSACTION_GAS,
+            ..Default::default()
+        },
+        body: vec![sign_tx_with_key_pair(
+            key_pair,
+            Transaction::Eip2930(TxEip2930 {
+                chain_id: chain_spec.chain.id(),
+                nonce: 3,
+                gas_limit: MIN_TRANSACTION_GAS as u128,
+                gas_price: 1_500_000_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(0.1 * ETH_TO_WEI as f64),
+                ..Default::default()
+            }),
+        )],
+        ..Default::default()
+    }
+        .with_recovered_senders()
+        .ok_or_eyre("failed to recover senders")?;
+
+    Ok((block1, block2, block3, block4))
 }
 
 pub(crate) fn blocks_and_execution_outputs<N>(
@@ -160,17 +218,23 @@ pub(crate) fn blocks_and_execution_outputs<N>(
 where
     N: ProviderNodeTypes,
 {
-    let (block1, block2) = blocks(chain_spec.clone(), key_pair)?;
+    let (block1, block2, block3, block4) = blocks(chain_spec.clone(), key_pair)?;
 
     let block_output1 =
         execute_block_and_commit_to_database(&provider_factory, chain_spec.clone(), &block1)?;
     let block_output2 =
-        execute_block_and_commit_to_database(&provider_factory, chain_spec, &block2)?;
+        execute_block_and_commit_to_database(&provider_factory, chain_spec.clone(), &block2)?;
+    let block_output3 =
+        execute_block_and_commit_to_database(&provider_factory, chain_spec.clone(), &block3)?;
+    let block_output4 =
+        execute_block_and_commit_to_database(&provider_factory, chain_spec, &block4)?;
 
     let block1 = block1.seal_slow();
     let block2 = block2.seal_slow();
+    let block3 = block3.seal_slow();
+    let block4 = block4.seal_slow();
 
-    Ok(vec![(block1, block_output1), (block2, block_output2)])
+    Ok(vec![(block1, block_output1), (block2, block_output2), (block3, block_output3), (block4, block_output4)])
 }
 
 pub(crate) fn blocks_and_execution_outcome<N>(
@@ -181,7 +245,7 @@ pub(crate) fn blocks_and_execution_outcome<N>(
 where
     N: ProviderNodeTypes,
 {
-    let (block1, block2) = blocks(chain_spec.clone(), key_pair)?;
+    let (block1, block2, block3, block4) = blocks(chain_spec.clone(), key_pair)?;
 
     let provider = provider_factory.provider()?;
 
@@ -193,21 +257,25 @@ where
     let mut execution_outcome = executor.execute_and_verify_batch(vec![
         (&block1, U256::ZERO).into(),
         (&block2, U256::ZERO).into(),
+        (&block3, U256::ZERO).into(),
+        (&block4, U256::ZERO).into(),
     ])?;
     execution_outcome.state_mut().reverts.sort();
 
     let block1 = block1.seal_slow();
     let block2 = block2.seal_slow();
+    let block3 = block3.seal_slow();
+    let block4 = block4.seal_slow();
 
     // Commit the block's execution outcome to the database
     let provider_rw = provider_factory.provider_rw()?;
     provider_rw.append_blocks_with_state(
-        vec![block1.clone(), block2.clone()],
+        vec![block1.clone(), block2.clone(), block3.clone(), block4.clone()],
         execution_outcome.clone(),
         Default::default(),
         Default::default(),
     )?;
     provider_rw.commit()?;
 
-    Ok((vec![block1, block2], execution_outcome))
+    Ok((vec![block1, block2, block3, block4], execution_outcome))
 }
