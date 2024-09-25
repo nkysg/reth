@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{BlockNumber, TxHash, B256};
+use alloy_primitives::{BlockHash, BlockNumber, TxHash};
 use alloy_rpc_types::{
     BlockNumHash, Filter, FilterBlockOption, FilterChanges, FilterId, FilteredParams, Log,
     PendingTransactionFilterKind,
@@ -175,10 +175,8 @@ where
 
     /// update a reorg block for all active filters
     async fn update_reorg(&self, old_blocks: &BTreeMap<BlockNumber, SealedBlockWithSenders>) {
-        let mut reorg_blocks = HashMap::<B256, BlockNumber>::with_capacity(old_blocks.len());
-        for block in old_blocks.values() {
-            reorg_blocks.insert(block.header.hash(), block.header.header().number);
-        }
+        let reorg_blocks: HashMap<BlockHash, BlockNumber> =
+            old_blocks.iter().map(|(k, v)| (v.header.hash(), *k)).collect();
 
         for active_filter in self.active_filters().inner.lock().await.values_mut() {
             if let FilterKind::Log(filter) = &active_filter.kind {
@@ -452,7 +450,7 @@ where
     async fn logs_for_filter(
         &self,
         filter: Filter,
-        reorg_blocks: Arc<RwLock<HashMap<B256, BlockNumber>>>,
+        reorg_blocks: Arc<RwLock<HashMap<BlockHash, BlockNumber>>>,
     ) -> Result<Vec<Log>, EthFilterError> {
         match filter.block_option {
             FilterBlockOption::AtBlockHash(block_hash) => {
@@ -546,7 +544,7 @@ where
         from_block: u64,
         to_block: u64,
         chain_info: ChainInfo,
-        reorg_blocks: Arc<RwLock<HashMap<B256, BlockNumber>>>,
+        reorg_blocks: Arc<RwLock<HashMap<BlockHash, BlockNumber>>>,
     ) -> Result<Vec<Log>, EthFilterError> {
         trace!(target: "rpc::eth::filter", from=from_block, to=to_block, ?filter, "finding logs in range");
         let best_number = chain_info.best_number;
@@ -672,7 +670,7 @@ struct ActiveFilter<T> {
     /// What kind of filter it is.
     kind: FilterKind<T>,
     /// reorg blocks that are relevant to this filter
-    reorg_blocks: Arc<RwLock<HashMap<B256, BlockNumber>>>,
+    reorg_blocks: Arc<RwLock<HashMap<BlockHash, BlockNumber>>>,
 }
 
 /// A receiver for pending transactions that returns all new transactions since the last poll.
