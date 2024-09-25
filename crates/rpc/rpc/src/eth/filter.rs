@@ -226,10 +226,9 @@ where
 
         // start_block is the block from which we should start fetching changes, the next block from
         // the last time changes were polled, in other words the best block at last poll + 1
-        let (start_block, kind, reorg_blocks) = {
-            let mut filters = self.inner.active_filters.inner.lock().await;
-            let filter = filters.get_mut(&id).ok_or(EthFilterError::FilterNotFound(id))?;
-
+        let mut filters = self.inner.active_filters.inner.lock().await;
+        let filter = filters.get_mut(&id).ok_or(EthFilterError::FilterNotFound(id))?;
+        let (start_block, kind,  reorg_blocks) = {
             if filter.block > best_number {
                 // no new blocks since the last poll
                 return Ok(FilterChanges::Empty)
@@ -242,7 +241,7 @@ where
             std::mem::swap(&mut filter.block, &mut block);
             filter.last_poll_timestamp = Instant::now();
 
-            (block, filter.kind.clone(), filter.reorg_blocks.clone())
+            (block, filter.kind.clone(), &filter.reorg_blocks)
         };
 
         match kind {
@@ -298,12 +297,12 @@ where
     ///
     /// Handler for `eth_getFilterLogs`
     pub async fn filter_logs(&self, id: FilterId) -> Result<Vec<Log>, EthFilterError> {
+        let filters = self.inner.active_filters.inner.lock().await;
+        let active_filter =
+            filters.get(&id).ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
         let (filter, reorg_blocks) = {
-            let filters = self.inner.active_filters.inner.lock().await;
-            let active_filter =
-                filters.get(&id).ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
             if let FilterKind::Log(ref filter) = active_filter.kind {
-                (*filter.clone(), active_filter.reorg_blocks.clone())
+                (*filter.clone(), &active_filter.reorg_blocks)
             } else {
                 // Not a log filter
                 return Err(EthFilterError::FilterNotFound(id))
@@ -401,7 +400,7 @@ where
     /// Handler for `eth_getLogs`
     async fn logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
         trace!(target: "rpc::eth", "Serving eth_getLogs");
-        Ok(self.inner.logs_for_filter(filter, Arc::new(RwLock::new(HashMap::new()))).await?)
+        Ok(self.inner.logs_for_filter(filter, &RwLock::new(HashMap::new())).await?)
     }
 }
 
@@ -448,7 +447,7 @@ where
     async fn logs_for_filter(
         &self,
         filter: Filter,
-        reorg_blocks: Arc<RwLock<HashMap<BlockHash, BlockNumber>>>,
+        reorg_blocks: &RwLock<HashMap<BlockHash, BlockNumber>>,
     ) -> Result<Vec<Log>, EthFilterError> {
         match filter.block_option {
             FilterBlockOption::AtBlockHash(block_hash) => {
@@ -507,7 +506,7 @@ where
                     from_block_number,
                     to_block_number,
                     info,
-                    Arc::new(RwLock::new(HashMap::new())),
+                   &RwLock::new(HashMap::new()),
                 )
                 .await
             }
@@ -525,7 +524,7 @@ where
                 block: last_poll_block_number,
                 last_poll_timestamp: Instant::now(),
                 kind,
-                reorg_blocks: Arc::new(RwLock::new(HashMap::new())),
+                reorg_blocks: RwLock::new(HashMap::new()),
             },
         );
         Ok(id)
@@ -542,7 +541,7 @@ where
         from_block: u64,
         to_block: u64,
         chain_info: ChainInfo,
-        reorg_blocks: Arc<RwLock<HashMap<BlockHash, BlockNumber>>>,
+        reorg_blocks: &RwLock<HashMap<BlockHash, BlockNumber>>,
     ) -> Result<Vec<Log>, EthFilterError> {
         trace!(target: "rpc::eth::filter", from=from_block, to=to_block, ?filter, "finding logs in range");
         let best_number = chain_info.best_number;
@@ -668,7 +667,7 @@ struct ActiveFilter<T> {
     /// What kind of filter it is.
     kind: FilterKind<T>,
     /// reorg blocks that are relevant to this filter
-    reorg_blocks: Arc<RwLock<HashMap<BlockHash, BlockNumber>>>,
+    reorg_blocks: RwLock<HashMap<BlockHash, BlockNumber>>,
 }
 
 /// A receiver for pending transactions that returns all new transactions since the last poll.
