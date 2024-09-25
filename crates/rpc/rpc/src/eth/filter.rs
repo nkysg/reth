@@ -24,8 +24,8 @@ use reth_primitives::{
     IntoRecoveredTransaction, SealedBlockWithSenders, TransactionSignedEcRecovered,
 };
 use reth_provider::{
-    BlockIdReader, BlockReader, CanonStateNotification, CanonStateSubscriptions, EvmEnvProvider,
-    ProviderError,
+    BlockIdReader, BlockReader, CanonStateNotification, CanonStateNotificationStream,
+    CanonStateSubscriptions, EvmEnvProvider, ProviderError,
 };
 use reth_rpc_eth_api::{EthFilterApiServer, FullEthApiTypes, RpcTransaction, TransactionCompat};
 use reth_rpc_eth_types::{
@@ -40,6 +40,7 @@ use tokio::{
     sync::{mpsc::Receiver, Mutex},
     time::MissedTickBehavior,
 };
+use tokio_stream::StreamExt;
 use tracing::trace;
 
 /// The maximum number of headers we read at once when handling a range filter.
@@ -121,7 +122,8 @@ where
         self.inner.task_spawner.spawn_critical(
             "eth-filters-watch-reorgs",
             Box::pin(async move {
-                this.watch_reorgs(events).await;
+                let notifications = events.canonical_state_stream();
+                this.watch_reorgs(notifications).await;
             }),
         );
     }
@@ -161,12 +163,8 @@ where
     }
 
     /// Watch block reorgs and update filters accordingly
-    async fn watch_reorgs<Events>(&self, events: Events)
-    where
-        Events: CanonStateSubscriptions,
-    {
-        let mut canon_state_notifications = events.subscribe_to_canonical_state();
-        while let Ok(notification) = canon_state_notifications.recv().await {
+    async fn watch_reorgs(&self, mut notifications: CanonStateNotificationStream) {
+        while let Some(notification) = notifications.next().await {
             if let CanonStateNotification::Reorg { old, .. } = notification {
                 self.update_reorg(old.blocks()).await;
             }
