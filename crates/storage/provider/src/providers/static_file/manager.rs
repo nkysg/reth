@@ -1364,7 +1364,6 @@ impl TransactionsProviderExt for StaticFileProvider {
         // chunks are too big, there will be idle threads waiting for work. Choosing an
         // arbitrary smaller value to make sure it doesn't happen.
         let chunk_size = 100;
-
         // iterator over the chunks
         let chunks = tx_range
             .clone()

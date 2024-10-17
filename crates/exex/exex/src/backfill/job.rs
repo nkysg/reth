@@ -82,6 +82,7 @@ where
         let mut cumulative_gas = 0;
         let batch_start = Instant::now();
 
+        // XXX FIXME YSG
         let mut blocks = Vec::new();
         for block_number in self.range.clone() {
             // Fetch the block

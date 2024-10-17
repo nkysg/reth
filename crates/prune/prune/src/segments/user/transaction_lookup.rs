@@ -138,6 +138,7 @@ mod tests {
         );
         db.insert_blocks(blocks.iter(), StorageKind::Database(None)).expect("insert blocks");
 
+        // XXX FIXME YSG
         let mut tx_hash_numbers = Vec::new();
         for block in &blocks {
             tx_hash_numbers.reserve_exact(block.body.transactions.len());

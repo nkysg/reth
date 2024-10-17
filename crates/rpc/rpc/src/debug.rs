@@ -134,6 +134,7 @@ where
                         }),
                     )?;
 
+                    // XXX FIXME YSG
                     results.push(TraceResult::Success { result, tx_hash: Some(tx_hash) });
                     if transactions.peek().is_some() {
                         // need to apply the state changes of this transaction before executing the

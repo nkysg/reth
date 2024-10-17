@@ -185,7 +185,6 @@ pub fn build_block<T: TransactionCompat>(
     let mut calls: Vec<SimCallResult> = Vec::with_capacity(results.len());
     let mut senders = Vec::with_capacity(results.len());
     let mut receipts = Vec::with_capacity(results.len());
-
     let mut log_index = 0;
     for (transaction_index, ((sender, result), tx)) in
         results.into_iter().zip(transactions.iter()).enumerate()

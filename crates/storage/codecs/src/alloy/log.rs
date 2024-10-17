@@ -11,6 +11,7 @@ impl Compact for LogData {
     where
         B: BufMut + AsMut<[u8]>,
     {
+        // XXX FIXME YSG
         let mut buffer = Vec::new();
 
         self.topics().specialized_to_compact(&mut buffer);
@@ -33,6 +34,7 @@ impl Compact for Log {
     where
         B: BufMut + AsMut<[u8]>,
     {
+        // XXX FIXME YSG
         let mut buffer = Vec::new();
         self.address.to_compact(&mut buffer);
         self.data.to_compact(&mut buffer);

@@ -428,8 +428,14 @@ mod tests {
         let mut rng = generators::rng();
 
         // Build mock data
+<<<<<<< HEAD
         let mut gas_used_ratios = Vec::with_capacity(block_count as usize);
         let mut base_fees_per_gas = Vec::with_capacity(block_count as usize);
+=======
+        // XXX FIXME YSG
+        let mut gas_used_ratios = Vec::new();
+        let mut base_fees_per_gas = Vec::new();
+>>>>>>> c701e51e5 (update issues need to fix)
         let mut last_header = None;
         let mut parent_hash = B256::default();
 

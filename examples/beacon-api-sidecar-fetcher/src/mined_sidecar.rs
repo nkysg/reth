@@ -101,6 +101,7 @@ where
             .collect();
 
         let mut all_blobs_available = true;
+        // XXX FIXME YSG
         let mut actions_to_queue: Vec<BlobTransactionEvent> = Vec::new();
 
         if txs.is_empty() {

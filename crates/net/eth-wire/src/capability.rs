@@ -332,6 +332,7 @@ pub fn shared_capability_offsets(
 
     // order versions based on capability name (alphabetical) and select offsets based on
     // BASE_OFFSET + prev_total_message
+    // XXX FIXME YSG
     let mut shared_with_offsets = Vec::new();
 
     // Message IDs are assumed to be compact from ID 0x10 onwards (0x00-0x0f is reserved for the
