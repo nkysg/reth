@@ -306,6 +306,7 @@ pub fn calculate_reward_percentiles_for_block(
     let mut tx_index = 0;
     let mut cumulative_gas_used = transactions.first().map(|tx| tx.gas_used).unwrap_or_default();
     let mut rewards_in_block = Vec::new();
+    // XXX FIXME YSG
     for percentile in percentiles {
         // Empty blocks should return in a zero row
         if transactions.is_empty() {

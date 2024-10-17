@@ -108,6 +108,7 @@ mod tests {
         );
         db.insert_blocks(blocks.iter(), StorageKind::Database(None)).expect("insert blocks");
 
+        // XXX FIXME YSG
         let mut transaction_senders = Vec::new();
         for block in &blocks {
             for transaction in &block.body.transactions {

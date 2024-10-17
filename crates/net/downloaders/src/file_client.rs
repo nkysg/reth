@@ -273,6 +273,7 @@ impl HeadersClient for FileClient {
         _priority: Priority,
     ) -> Self::Output {
         // this just searches the buffer, and fails if it can't find the header
+        // XXX FIXME YSG
         let mut headers = Vec::new();
         trace!(target: "downloaders::file", request=?request, "Getting headers");
 
@@ -323,6 +324,7 @@ impl BodiesClient for FileClient {
         _priority: Priority,
     ) -> Self::Output {
         // this just searches the buffer, and fails if it can't find the block
+        // XXX FIXME YSG
         let mut bodies = Vec::new();
 
         // check if any are an error

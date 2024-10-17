@@ -1363,6 +1363,7 @@ impl TransactionsProviderExt for StaticFileProvider {
         // chunks are too big, there will be idle threads waiting for work. Choosing an
         // arbitrary smaller value to make sure it doesn't happen.
         let chunk_size = 100;
+        // XXX FIXME YSG
         let mut channels = Vec::new();
 
         // iterator over the chunks

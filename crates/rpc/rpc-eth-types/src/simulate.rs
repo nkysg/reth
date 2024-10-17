@@ -183,6 +183,7 @@ pub fn build_block<T: TransactionCompat>(
 ) -> Result<SimulatedBlock<Block<T::Transaction>>, EthApiError> {
     let mut calls: Vec<SimCallResult> = Vec::with_capacity(results.len());
     let mut senders = Vec::with_capacity(results.len());
+    // XXX FIXME YSG
     let mut receipts = Vec::new();
 
     let mut log_index = 0;

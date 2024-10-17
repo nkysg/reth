@@ -228,10 +228,12 @@ impl Chain {
     ///
     /// Attachment includes block number, block hash, transaction hash and transaction index.
     pub fn receipts_with_attachment(&self) -> Vec<BlockReceipts> {
+        // XXX FIXME YSG
         let mut receipt_attach = Vec::new();
         for ((block_num, block), receipts) in
             self.blocks().iter().zip(self.execution_outcome.receipts().iter())
         {
+            // XXX FIXME YSG
             let mut tx_receipts = Vec::new();
             for (tx, receipt) in block.body.transactions().zip(receipts.iter()) {
                 tx_receipts.push((

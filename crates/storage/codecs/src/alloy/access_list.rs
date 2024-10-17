@@ -9,6 +9,7 @@ impl Compact for AccessListItem {
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
+        // XXX FIXE YSG
         let mut buffer = Vec::new();
         self.address.to_compact(&mut buffer);
         self.storage_keys.specialized_to_compact(&mut buffer);
@@ -31,6 +32,7 @@ impl Compact for AccessList {
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
+        // XXX FIXME YSG
         let mut buffer = Vec::new();
         self.0.to_compact(&mut buffer);
         buf.put(&buffer[..]);

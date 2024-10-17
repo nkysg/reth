@@ -112,6 +112,7 @@ pub trait EthFees: LoadFee {
             let start_block = end_block_plus - block_count;
 
             // Collect base fees, gas usage ratios and (optionally) reward percentile data
+            // XXX FIXME YSG
             let mut base_fee_per_gas: Vec<u128> = Vec::new();
             let mut gas_used_ratio: Vec<f64> = Vec::new();
 

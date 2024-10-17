@@ -34,6 +34,7 @@ impl<Provider> PipelineBuilder<Provider> {
     /// [`builder`][StageSet::builder] on the set which will convert it to a
     /// [`StageSetBuilder`][crate::StageSetBuilder].
     pub fn add_stages<Set: StageSet<Provider>>(mut self, set: Set) -> Self {
+        // XXX FIXME YSG
         for stage in set.builder().build() {
             self.stages.push(stage);
         }

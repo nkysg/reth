@@ -107,8 +107,7 @@ where
     ///     - `provider_factory`: A factory for creating various blockchain-related providers, such
     ///       as for accessing the database or static files.
     ///     - `consensus`: The consensus configuration, which defines how the node reaches agreement
-    ///       on the blockchain state with other nodes.
-    ///        XXX FIXME YSG
+    ///       on the blockchain state with other nodes. XXX FIXME YSG
     ///     - `evm_config`: The EVM (Ethereum Virtual Machine) configuration, which affects how
     ///       smart contracts and transactions are executed. Proper validation of this configuration
     ///       is crucial for the correct execution of transactions.
@@ -904,6 +903,7 @@ where
 
         // check unconnected block buffer for children of the chains
         let mut all_chain_blocks = Vec::new();
+        // XXX FIXME YSG
         for chain in self.state.chains.values() {
             for (&number, block) in chain.blocks() {
                 all_chain_blocks.push(BlockNumHash { number, hash: block.hash() })

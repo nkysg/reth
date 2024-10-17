@@ -3479,6 +3479,7 @@ mod tests {
         }
 
         // for each block in chain_b, reorg to it and then back to canonical
+        // XXX FIXME YSG
         let mut expected_new = Vec::new();
         for block in &chain_b {
             // reorg to chain from block b

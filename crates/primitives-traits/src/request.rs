@@ -33,6 +33,7 @@ impl Encodable for Requests {
     fn encode(&self, out: &mut dyn bytes::BufMut) {
         let mut h = alloy_rlp::Header { list: true, payload_length: 0 };
 
+        // XXX FIXME YSG
         let mut encoded = Vec::new();
         for req in &self.0 {
             let encoded_req = req.encoded_7685();

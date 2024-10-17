@@ -66,6 +66,7 @@ fn generate_many_transactions(senders: usize, max_depth: usize) -> Vec<MockTrans
     let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &SEED);
     let mut runner = TestRunner::new_with_rng(config, rng);
 
+    // XXX FIXE YSG
     let mut txs = Vec::new();
     for idx in 0..senders {
         // modulo max_depth so we know it is bounded, plus one so the minimum is always 1

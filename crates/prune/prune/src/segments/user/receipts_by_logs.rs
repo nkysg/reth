@@ -259,6 +259,7 @@ mod tests {
         .concat();
         db.insert_blocks(blocks.iter(), StorageKind::Database(None)).expect("insert blocks");
 
+        // XXX FIXME YSG
         let mut receipts = Vec::new();
 
         let (deposit_contract_addr, _) = random_eoa_account(&mut rng);

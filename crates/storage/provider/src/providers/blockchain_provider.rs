@@ -156,6 +156,7 @@ impl<N: ProviderNodeTypes> BlockchainProvider2<N> {
         let end_block_number = *range.end();
 
         // We are not removing block meta as it is used to get block changesets.
+        // XXX FIXME YSG
         let mut block_bodies = Vec::new();
         for block_num in range.clone() {
             let block_body = self

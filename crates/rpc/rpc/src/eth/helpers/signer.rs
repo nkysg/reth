@@ -40,6 +40,7 @@ impl DevSigner {
     /// Generates provided number of random dev signers
     /// which satisfy [`EthSigner`] trait
     pub fn random_signers(num: u32) -> Vec<Box<dyn EthSigner + 'static>> {
+        // XXX FIXME YSG
         let mut signers = Vec::new();
         for _ in 0..num {
             let sk = PrivateKeySigner::random_with(&mut rand::thread_rng());

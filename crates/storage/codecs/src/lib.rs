@@ -484,6 +484,7 @@ mod tests {
 
     #[test]
     fn compact_address() {
+        // XXX FIXME YSG
         let mut buf = vec![];
         assert_eq!(Address::ZERO.to_compact(&mut buf), 20);
         assert_eq!(buf, vec![0; 20]);

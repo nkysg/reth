@@ -931,6 +931,7 @@ mod tests {
                     return Poll::Ready(None)
                 }
 
+                // XXX FIXME YSG
                 let mut response = Vec::default();
                 while let Some(header) = this.headers.pop_front() {
                     if header.is_empty() {
