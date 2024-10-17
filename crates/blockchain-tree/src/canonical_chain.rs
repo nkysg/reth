@@ -56,6 +56,7 @@ impl CanonicalChain {
     }
 
     #[inline]
+    // XXX FIXME YSG, what's meaning tip
     pub(crate) fn tip(&self) -> BlockNumHash {
         self.chain
             .last_key_value()
