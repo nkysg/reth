@@ -108,11 +108,13 @@ where
     ///       as for accessing the database or static files.
     ///     - `consensus`: The consensus configuration, which defines how the node reaches agreement
     ///       on the blockchain state with other nodes.
+    ///        XXX FIXME YSG
     ///     - `evm_config`: The EVM (Ethereum Virtual Machine) configuration, which affects how
     ///       smart contracts and transactions are executed. Proper validation of this configuration
     ///       is crucial for the correct execution of transactions.
     /// - `tree_config`: Configuration for the blockchain tree, including any parameters that affect
     ///   its structure or performance.
+    ///  XXX FIXME YSG
     /// - `prune_modes`: Configuration for pruning old blockchain data. This helps in managing the
     ///   storage space efficiently. It's important to validate this configuration to ensure it does
     ///   not lead to unintended data loss.
@@ -666,6 +668,7 @@ where
         self.state.lowest_buffered_ancestor(hash)
     }
 
+    // XXX FIXME YSG why need without senders
     /// Insert a new block into the tree.
     ///
     /// # Note

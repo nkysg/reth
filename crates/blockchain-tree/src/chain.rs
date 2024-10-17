@@ -103,6 +103,7 @@ impl AppendableChain {
     /// Create a new chain that forks off of an existing sidechain.
     ///
     /// This differs from [`AppendableChain::new_canonical_fork`] in that this starts a new fork.
+    /// XXX FIXME why side_chain_block_hashes is not ref
     pub(crate) fn new_chain_fork<N, E>(
         &self,
         block: SealedBlockWithSenders,
@@ -175,6 +176,7 @@ impl AppendableChain {
         block_validation_kind: BlockValidationKind,
     ) -> Result<(ExecutionOutcome, Option<TrieUpdates>), BlockExecutionError>
     where
+    /// XXX FIXME YSG FullExecutionDataProvider mean
         EDP: FullExecutionDataProvider,
         N: ProviderNodeTypes,
         E: BlockExecutorProvider,
@@ -270,6 +272,7 @@ impl AppendableChain {
     /// CAUTION: This will only perform state root check if it's possible: if the `canonical_fork`
     /// is the canonical head, or: state root check can't be performed if the given canonical is
     /// __not__ the canonical head.
+    ///     /// XXX FIXME why side_chain_block_hashes is not ref
     #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_block<N, E>(
