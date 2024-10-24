@@ -133,6 +133,7 @@ impl tokio_util::codec::Encoder<String> for StreamCodec {
         if let Separator::Byte(separator) = self.outgoing_separator {
             payload.push(separator);
         }
+        // XXX FIXME YSG
         buf.extend_from_slice(&payload);
         Ok(())
     }

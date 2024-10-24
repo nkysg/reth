@@ -535,6 +535,7 @@ mod test {
         // rig
 
         let mut receipt_1_to_3 = MOCK_RECEIPT_ENCODED_BLOCK_1.to_vec();
+        // XXX FIXME YSG
         receipt_1_to_3.extend_from_slice(MOCK_RECEIPT_ENCODED_BLOCK_2);
         receipt_1_to_3.extend_from_slice(MOCK_RECEIPT_ENCODED_BLOCK_3);
 
@@ -564,6 +565,7 @@ mod test {
         // genesis block has no hack receipts
         let mut encoded_receipts = MOCK_RECEIPT_BLOCK_NO_TRANSACTIONS.to_vec();
         // one receipt each for block 1 and 2
+        // XXX FIXME YSG
         encoded_receipts.extend_from_slice(MOCK_RECEIPT_ENCODED_BLOCK_1);
         encoded_receipts.extend_from_slice(MOCK_RECEIPT_ENCODED_BLOCK_2);
         // no receipt for block 4
@@ -598,6 +600,7 @@ mod test {
 
         // genesis block has no hack receipts
         let mut encoded_receipts = MOCK_RECEIPT_BLOCK_NO_TRANSACTIONS.to_vec();
+        // XXX FIXME YSG
         // one receipt each for block 1
         encoded_receipts.extend_from_slice(MOCK_RECEIPT_ENCODED_BLOCK_1);
         // no receipt for block 2
@@ -634,6 +637,7 @@ mod test {
 
         // genesis block has no hack receipts
         let mut encoded_receipts = MOCK_RECEIPT_BLOCK_NO_TRANSACTIONS.to_vec();
+        // XXX FIXME YSG
         // one receipt each for block 1
         encoded_receipts.extend_from_slice(MOCK_RECEIPT_ENCODED_BLOCK_1);
         // two receipts for block 2

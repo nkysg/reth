@@ -48,6 +48,7 @@ impl<T: Encode> Encode for ShardedKey<T> {
 
     fn encode(self) -> Self::Encoded {
         let mut buf: Vec<u8> = Encode::encode(self.key).into();
+        // XXX FIXME YSG
         buf.extend_from_slice(&self.highest_block_number.to_be_bytes());
         buf
     }

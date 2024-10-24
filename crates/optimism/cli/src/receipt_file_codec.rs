@@ -321,6 +321,7 @@ pub(crate) mod test {
         // rig
 
         let mut receipt_1_to_3 = HACK_RECEIPT_ENCODED_BLOCK_1.to_vec();
+        // XXX FIXME YSG
         receipt_1_to_3.extend_from_slice(HACK_RECEIPT_ENCODED_BLOCK_2);
         receipt_1_to_3.extend_from_slice(HACK_RECEIPT_ENCODED_BLOCK_3);
 

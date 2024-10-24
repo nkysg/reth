@@ -109,6 +109,7 @@ impl Decoder for ECIESCodec {
 
                     let mut data = buf.split_to(self.ecies.body_len());
                     let mut ret = BytesMut::new();
+                    // XXX FIXME YSG
                     ret.extend_from_slice(self.ecies.read_body(&mut data)?);
 
                     self.state = ECIESState::Header;

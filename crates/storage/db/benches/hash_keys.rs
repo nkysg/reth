@@ -97,6 +97,7 @@ where
 
             let mut unsorted_input = unsorted_input.clone();
             if scenario_str == "append_all" {
+                // XXX FIXME YSG
                 unsorted_input.extend_from_slice(&preload);
             }
 

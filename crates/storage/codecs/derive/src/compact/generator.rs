@@ -96,6 +96,7 @@ fn generate_from_compact(fields: &FieldList, ident: &Ident, is_zstd: bool) -> To
     // it's hard to figure out with derive_macro which types have Bytes fields.
     //
     // This removes the requirement of the field to be placed last in the struct.
+    // XXX FIXME YSG
     known_types.extend_from_slice(&["TxKind", "AccessList", "Signature", "CheckpointBlockRange"]);
 
     // let mut handle = FieldListHandler::new(fields);

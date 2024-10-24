@@ -393,6 +393,7 @@ impl ECIES {
         let tag =
             hmac_sha256(mac_key.as_ref(), &[iv.as_slice(), &encrypted], &total_size.to_be_bytes());
 
+        // XXX FIXME YSG
         out.extend_from_slice(iv.as_slice());
         out.extend_from_slice(&encrypted);
         out.extend_from_slice(tag.as_ref());
@@ -645,6 +646,7 @@ impl ECIES {
         self.egress_mac.as_mut().unwrap().update_header(&header);
         let tag = self.egress_mac.as_mut().unwrap().digest();
 
+        // XXX FIXME YSG
         out.reserve(Self::header_len());
         out.extend_from_slice(&header[..]);
         out.extend_from_slice(tag.as_slice());
@@ -697,6 +699,7 @@ impl ECIES {
     }
 
     pub fn write_body(&mut self, out: &mut BytesMut, data: &[u8]) {
+        // XXX FIXME YSG div_ceil(16)
         let len = if data.len() % 16 == 0 { data.len() } else { (data.len() / 16 + 1) * 16 };
         let old_len = out.len();
         out.resize(old_len + len, 0);

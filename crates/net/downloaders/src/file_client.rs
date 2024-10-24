@@ -682,6 +682,7 @@ mod tests {
 
             // reverse to make sure it's in the right order before comparing
             downloaded_headers_chunk.reverse();
+            // XXX FIXME YSG
             downloaded_headers.extend_from_slice(&downloaded_headers_chunk);
         }
 

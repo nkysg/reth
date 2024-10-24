@@ -120,12 +120,14 @@ impl Message {
         );
 
         // Serialize the signature and append it to the signature bytes
+        // XXX FIXME YSG
         let (rec, sig) = signature.serialize_compact();
         sig_bytes.extend_from_slice(&sig);
         sig_bytes.put_u8(rec.to_i32() as u8);
         sig_bytes.unsplit(payload);
 
         // Calculate the hash of the signature bytes and append it to the datagram
+        // XXX FIXME YSG
         let hash = keccak256(&sig_bytes);
         datagram.extend_from_slice(hash.as_slice());
 
