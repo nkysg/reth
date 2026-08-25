@@ -388,7 +388,27 @@ where
                         (block_number, block_number)
                     }
                 };
-                let mut logs = self
+                let pending_logs = reorg_logs
+                    .into_iter()
+                    .filter(|pending| match block_option {
+                        FilterBlockOption::AtBlockHash(hash) => pending.block_hash == hash,
+                        FilterBlockOption::Range { .. } => {
+                            pending.block_number <= to_block_number &&
+                                (pending.removed || pending.block_number < from_block_number)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut logs = pending_logs
+                    .iter()
+                    .filter(|pending| pending.removed)
+                    .map(|pending| pending.log.clone())
+                    .collect::<Vec<_>>();
+                let added_logs = pending_logs
+                    .into_iter()
+                    .filter(|pending| !pending.removed)
+                    .map(|pending| pending.log)
+                    .collect::<Vec<_>>();
+                let canonical_logs = self
                     .inner
                     .clone()
                     .get_logs_in_block_range(
@@ -398,18 +418,8 @@ where
                         self.inner.query_limits,
                     )
                     .await?;
-                logs.extend(
-                    reorg_logs
-                        .into_iter()
-                        .filter(|pending| match block_option {
-                            FilterBlockOption::AtBlockHash(hash) => pending.block_hash == hash,
-                            FilterBlockOption::Range { .. } => {
-                                pending.block_number <= to_block_number &&
-                                    (pending.removed || pending.block_number < from_block_number)
-                            }
-                        })
-                        .map(|pending| pending.log),
-                );
+                logs.extend(canonical_logs);
+                logs.extend(added_logs);
                 Ok(FilterChanges::Logs(logs))
             }
         }
@@ -2238,5 +2248,153 @@ mod tests {
             eth_filter.filter_changes(FilterId::Num(1)).await.unwrap(),
             FilterChanges::Empty
         ));
+    }
+
+    #[tokio::test]
+    async fn test_reorg_logs_support_chain_round_trip() {
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            FixedBytes::from([1u8; 32]),
+            reth_ethereum_primitives::Block {
+                header: alloy_consensus::Header { number: 0, ..Default::default() },
+                body: Default::default(),
+            },
+        );
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let block_a = FixedBytes::from([7u8; 32]);
+        let block_b = FixedBytes::from([8u8; 32]);
+        let mut logs = Vec::new();
+        for (block_hash, removed) in [
+            (block_a, true),  // A -> B: A is removed
+            (block_b, false), // A -> B: B is added
+            (block_b, true),  // B -> A: B is removed
+            (block_a, false), // B -> A: A is added again
+        ] {
+            let mut log = alloy_rpc_types_eth::Log::default();
+            log.block_hash = Some(block_hash);
+            log.removed = removed;
+            logs.push(PendingReorgLog { block_hash, block_number: 0, removed, log });
+        }
+
+        eth_filter.inner.active_filters.inner.lock().await.insert(
+            FilterId::Num(1),
+            ActiveFilter {
+                block: 1,
+                last_poll_timestamp: Instant::now(),
+                kind: FilterKind::Log(Box::new(Filter::default())),
+                reorg_logs: logs,
+            },
+        );
+
+        let changes = eth_filter.filter_changes(FilterId::Num(1)).await.unwrap();
+        let FilterChanges::Logs(logs) = changes else { panic!("expected log changes") };
+        assert_eq!(logs.len(), 4);
+        assert_eq!(
+            logs.iter().map(|log| log.block_hash).collect::<Vec<_>>(),
+            vec![Some(block_a), Some(block_b), Some(block_b), Some(block_a),]
+        );
+        assert_eq!(
+            logs.iter().map(|log| log.removed).collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_log_rebirth() {
+        use alloy_consensus::TxLegacy;
+        use reth_chain_state::CanonStateNotification;
+        use reth_ethereum_primitives::{BlockBody, Receipt, TransactionSigned};
+        use reth_execution_types::{Chain, ExecutionOutcome};
+        use reth_primitives_traits::RecoveredBlock;
+        use std::collections::BTreeMap;
+
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            FixedBytes::from([1u8; 32]),
+            reth_ethereum_primitives::Block {
+                header: alloy_consensus::Header { number: 0, ..Default::default() },
+                body: Default::default(),
+            },
+        );
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        eth_filter.inner.active_filters.inner.lock().await.insert(
+            FilterId::Num(1),
+            ActiveFilter {
+                block: 1,
+                last_poll_timestamp: Instant::now(),
+                kind: FilterKind::Log(Box::new(Filter::default())),
+                reorg_logs: Vec::new(),
+            },
+        );
+
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy {
+                chain_id: Some(1),
+                nonce: 0,
+                gas_price: 1,
+                gas_limit: 21_000,
+                to: alloy_primitives::TxKind::Call(alloy_primitives::Address::ZERO),
+                value: alloy_primitives::U256::ZERO,
+                input: alloy_primitives::Bytes::new(),
+            }
+            .into(),
+            alloy_primitives::Signature::test_signature(),
+        );
+        let receipt = Receipt {
+            tx_type: reth_ethereum_primitives::TxType::Legacy,
+            cumulative_gas_used: 21_000,
+            logs: vec![alloy_primitives::Log {
+                address: alloy_primitives::Address::ZERO,
+                data: alloy_primitives::LogData::new_unchecked(
+                    Vec::new(),
+                    alloy_primitives::Bytes::new(),
+                ),
+            }],
+            success: true,
+        };
+
+        let make_chain = |hash: FixedBytes<32>| {
+            let block = reth_ethereum_primitives::Block {
+                header: alloy_consensus::Header { number: 0, ..Default::default() },
+                body: BlockBody { transactions: vec![tx.clone()], ..Default::default() },
+            };
+            let mut recovered =
+                RecoveredBlock::new_unhashed(block, vec![alloy_primitives::Address::ZERO]);
+            recovered.set_hash(hash);
+            Arc::new(Chain::new(
+                vec![recovered],
+                ExecutionOutcome::new(
+                    Default::default(),
+                    vec![vec![receipt.clone()]],
+                    0,
+                    Vec::new(),
+                ),
+                BTreeMap::new(),
+            ))
+        };
+
+        let block_a = FixedBytes::from([7u8; 32]);
+        let block_b = FixedBytes::from([8u8; 32]);
+        let notifications = futures::stream::iter([
+            CanonStateNotification::Reorg { old: make_chain(block_a), new: make_chain(block_b) },
+            CanonStateNotification::Reorg { old: make_chain(block_b), new: make_chain(block_a) },
+        ]);
+        eth_filter.watch_reorg(notifications).await;
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(FilterId::Num(1)).await.unwrap()
+        else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.len(), 4);
+        assert_eq!(
+            logs.iter().map(|log| log.block_hash).collect::<Vec<_>>(),
+            vec![Some(block_a), Some(block_b), Some(block_b), Some(block_a),]
+        );
+        assert_eq!(
+            logs.iter().map(|log| log.removed).collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
     }
 }
