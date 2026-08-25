@@ -1,5 +1,6 @@
+use reth_chain_state::CanonStateSubscriptions;
 use reth_rpc::{EthFilter, EthPubSub};
-use reth_rpc_eth_api::EthApiTypes;
+use reth_rpc_eth_api::{EthApiTypes, FullEthApiTypes};
 use reth_rpc_eth_types::EthConfig;
 use reth_tasks::Runtime;
 
@@ -16,13 +17,19 @@ pub struct EthHandlers<EthApi: EthApiTypes> {
 
 impl<EthApi> EthHandlers<EthApi>
 where
-    EthApi: EthApiTypes + 'static,
+    EthApi: FullEthApiTypes + 'static,
 {
     /// Returns a new instance with the additional handlers for the `eth` namespace.
     ///
     /// This will spawn all necessary tasks for the additional handlers.
     pub fn bootstrap(config: EthConfig, executor: Runtime, eth_api: EthApi) -> Self {
         let filter = EthFilter::new(eth_api.clone(), config.filter_config(), executor.clone());
+
+        let reorg_filter = filter.clone();
+        let notifications = eth_api.provider().canonical_state_stream();
+        executor.spawn_critical_task("eth-filters-reorg-watch", async move {
+            reorg_filter.watch_reorg(notifications).await;
+        });
 
         let pubsub = EthPubSub::new(eth_api.clone(), executor);
 
