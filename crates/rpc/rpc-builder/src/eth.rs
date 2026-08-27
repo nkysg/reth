@@ -26,9 +26,9 @@ where
         let filter = EthFilter::new(eth_api.clone(), config.filter_config(), executor.clone());
 
         let reorg_filter = filter.clone();
-        let notifications = eth_api.provider().canonical_state_stream();
-        executor.spawn_critical_task("eth-filters-reorg-watch", async move {
-            reorg_filter.watch_reorg(notifications).await;
+        let notifications = eth_api.provider().subscribe_to_canonical_state();
+        executor.spawn_critical_task("eth-filters-canonical-watch", async move {
+            reorg_filter.watch_canonical_state(notifications).await;
         });
 
         let pubsub = EthPubSub::new(eth_api.clone(), executor);
