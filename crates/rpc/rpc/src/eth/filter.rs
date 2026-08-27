@@ -34,7 +34,7 @@ use reth_storage_api::{
 use reth_tasks::Runtime;
 use reth_transaction_pool::{NewSubpoolTransactionStream, PoolTransaction, TransactionPool};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     iter::{Peekable, StepBy},
     ops::RangeInclusive,
@@ -116,6 +116,14 @@ where
     ) {
         while let Some(notification) = notifications.next().await {
             let CanonStateNotification::Reorg { old, new } = notification else { continue };
+            // The next canonical block that is not represented by the reorg notification. For a
+            // pure revert this is the first reverted height, which is also where canonical polling
+            // must resume once the chain starts growing again.
+            let reorg_cursor = new
+                .blocks_iter()
+                .last()
+                .map(|block| block.number().saturating_add(1))
+                .unwrap_or_else(|| old.first().number());
             let filters = {
                 let filters = self.inner.active_filters.inner.lock().await;
                 filters
@@ -126,8 +134,11 @@ where
                     })
                     .collect::<Vec<_>>()
             };
-            let mut updates = Vec::with_capacity(filters.len());
             for (id, poll_lock, filter) in filters {
+                // Serialize notification delivery with polling. The provider can become canonical
+                // before this task is scheduled, so additions already returned by the poll that
+                // held this lock first are filtered against the delivered block set below.
+                let _poll_guard = poll_lock.lock().await;
                 let mut reorg_logs = Vec::new();
                 for (block, receipts, removed) in old
                     .blocks_and_receipts()
@@ -161,15 +172,44 @@ where
                         }
                     }
                 }
-                if !reorg_logs.is_empty() {
-                    updates.push((id, poll_lock, reorg_logs));
-                }
-            }
-            let mut filters = self.inner.active_filters.inner.lock().await;
-            for (id, poll_lock, reorg_logs) in updates {
+                let mut filters = self.inner.active_filters.inner.lock().await;
                 let Some(active_filter) = filters.get_mut(&id) else { continue };
                 if Arc::ptr_eq(&active_filter.poll_lock, &poll_lock) {
-                    active_filter.reorg_logs.extend(reorg_logs);
+                    active_filter.reorg_cursor = Some(
+                        active_filter
+                            .reorg_cursor
+                            .map_or(reorg_cursor, |cursor| cursor.min(reorg_cursor)),
+                    );
+
+                    // Project the block-level delivery state through already queued events. This
+                    // preserves chained sequences such as A -> B -> A while suppressing an added
+                    // block that a concurrent canonical poll already returned.
+                    let mut delivered = active_filter.delivered_log_blocks.clone();
+                    for pending in &active_filter.reorg_logs {
+                        if pending.removed {
+                            delivered.remove(&pending.block_hash);
+                        } else {
+                            delivered.insert(pending.block_hash);
+                        }
+                    }
+
+                    let mut last_event = None;
+                    let mut include_event = true;
+                    for pending in reorg_logs {
+                        let event = (pending.block_hash, pending.removed);
+                        if last_event != Some(event) {
+                            include_event = if pending.removed {
+                                delivered.remove(&pending.block_hash);
+                                true
+                            } else {
+                                delivered.insert(pending.block_hash)
+                            };
+                            last_event = Some(event);
+                        }
+                        if include_event {
+                            active_filter.reorg_logs.push(pending);
+                        }
+                    }
                 }
             }
         }
@@ -315,12 +355,15 @@ where
 
         // start_block is the block from which we should start fetching changes, the next block from
         // the last time changes were polled, in other words the best block at last poll + 1
-        let (start_block, kind, reorg_logs) = {
+        let (start_block, kind, reorg_logs, reorg_cursor) = {
             let mut filters = self.inner.active_filters.inner.lock().await;
             let filter =
                 filters.get_mut(&id).ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
 
-            if filter.block > best_number && filter.reorg_logs.is_empty() {
+            if filter.block > best_number &&
+                filter.reorg_logs.is_empty() &&
+                filter.reorg_cursor.is_none()
+            {
                 // no new blocks since the last poll
                 return Ok(FilterChanges::Empty)
             }
@@ -332,9 +375,15 @@ where
             } else {
                 Vec::new()
             };
-            (filter.block, filter.kind.clone(), reorg_logs)
+            (
+                filter.block.min(filter.reorg_cursor.unwrap_or(filter.block)),
+                filter.kind.clone(),
+                reorg_logs,
+                filter.reorg_cursor,
+            )
         };
         let reorg_logs_len = reorg_logs.len();
+        let mut delivered_events = Vec::new();
 
         let changes = match kind {
             FilterKind::PendingTransaction(filter) => match filter.drain().await {
@@ -358,40 +407,31 @@ where
             FilterKind::Log(filter) => {
                 let block_option = filter.block_option;
                 let block_hash_logs = if let FilterBlockOption::AtBlockHash(hash) = block_option {
-                    let logs = reorg_logs
+                    let pending = reorg_logs
                         .iter()
                         .filter(|pending| pending.block_hash == hash)
-                        .map(|pending| pending.log.clone())
                         .collect::<Vec<_>>();
-                    (!logs.is_empty()).then_some(logs)
+                    if pending.is_empty() {
+                        None
+                    } else {
+                        delivered_events.extend(
+                            pending.iter().map(|pending| (pending.block_hash, pending.removed)),
+                        );
+                        Some(pending.into_iter().map(|pending| pending.log.clone()).collect())
+                    }
                 } else {
                     None
                 };
                 if let Some(logs) = block_hash_logs {
                     FilterChanges::Logs(logs)
                 } else if start_block > best_number {
-                    let logs = match block_option {
-                        FilterBlockOption::AtBlockHash(_) => Vec::new(),
-                        FilterBlockOption::Range { from_block, to_block } => {
-                            let from = from_block
-                                .map(|num| self.provider().convert_block_number(num))
-                                .transpose()?
-                                .flatten()
-                                .unwrap_or(0);
-                            let to = to_block
-                                .map(|num| self.provider().convert_block_number(num))
-                                .transpose()?
-                                .flatten()
-                                .unwrap_or(best_number);
-                            reorg_logs
-                                .into_iter()
-                                .filter(|pending| {
-                                    from <= pending.block_number && pending.block_number <= to
-                                })
-                                .map(|pending| pending.log)
-                                .collect()
-                        }
-                    };
+                    // Queued logs were matched against the complete filter when the notification
+                    // arrived. In particular, removed logs can be above the new head after a pure
+                    // revert and must not be clamped to `best_number` here.
+                    delivered_events.extend(
+                        reorg_logs.iter().map(|pending| (pending.block_hash, pending.removed)),
+                    );
+                    let logs = reorg_logs.into_iter().map(|pending| pending.log).collect();
                     FilterChanges::Logs(logs)
                 } else {
                     let (from_block_number, to_block_number) = match block_option {
@@ -416,15 +456,21 @@ where
                             (block_number, block_number)
                         }
                     };
-                    let pending_logs =
-                        reorg_logs.into_iter().filter(|pending| match block_option {
+                    let pending_logs = reorg_logs
+                        .into_iter()
+                        .filter(|pending| match block_option {
                             FilterBlockOption::AtBlockHash(hash) => pending.block_hash == hash,
                             FilterBlockOption::Range { .. } => {
-                                pending.block_number <= to_block_number &&
-                                    (pending.removed || pending.block_number < from_block_number)
+                                pending.removed ||
+                                    pending.block_number < from_block_number ||
+                                    pending.block_number > to_block_number
                             }
-                        });
-                    let canonical_logs = self
+                        })
+                        .collect::<Vec<_>>();
+                    delivered_events.extend(
+                        pending_logs.iter().map(|pending| (pending.block_hash, pending.removed)),
+                    );
+                    let (canonical_logs, canonical_log_blocks) = self
                         .inner
                         .clone()
                         .get_logs_in_block_range(
@@ -434,10 +480,14 @@ where
                             self.inner.query_limits,
                         )
                         .await?;
+                    delivered_events.extend(
+                        canonical_log_blocks.into_iter().map(|block_hash| (block_hash, false)),
+                    );
                     // Reorg notifications are queued in observation order. Emit them before the
                     // canonical range so replacements at earlier heights are not reordered behind
                     // newly mined blocks.
-                    let mut logs = pending_logs.map(|pending| pending.log).collect::<Vec<_>>();
+                    let mut logs =
+                        pending_logs.into_iter().map(|pending| pending.log).collect::<Vec<_>>();
                     logs.extend(canonical_logs);
                     FilterChanges::Logs(logs)
                 }
@@ -452,6 +502,22 @@ where
         {
             filter.block = best_number + 1;
             filter.reorg_logs.drain(..reorg_logs_len.min(filter.reorg_logs.len()));
+            if reorg_cursor == filter.reorg_cursor {
+                filter.reorg_cursor = None;
+            }
+            if !delivered_events.is_empty() {
+                // Only the most recent non-empty response can race with a notification waiting on
+                // `poll_lock`. Replacing the set keeps this state bounded for long-lived filters.
+                let mut delivered_log_blocks = HashSet::new();
+                for (block_hash, removed) in delivered_events {
+                    if removed {
+                        delivered_log_blocks.remove(&block_hash);
+                    } else {
+                        delivered_log_blocks.insert(block_hash);
+                    }
+                }
+                filter.delivered_log_blocks = delivered_log_blocks;
+            }
         }
         Ok(changes)
     }
@@ -754,6 +820,7 @@ where
 
                 self.get_logs_in_block_range(filter, from_block_number, to_block_number, limits)
                     .await
+                    .map(|(logs, _)| logs)
             }
         }
     }
@@ -779,6 +846,8 @@ where
                 last_poll_timestamp: Instant::now(),
                 kind,
                 reorg_logs: Vec::new(),
+                reorg_cursor: None,
+                delivered_log_blocks: HashSet::new(),
             },
         );
         Ok(id)
@@ -795,7 +864,8 @@ where
         from_block: u64,
         to_block: u64,
         limits: QueryLimits,
-    ) -> Result<Vec<RpcLog<Eth::NetworkTypes>>, EthFilterError> {
+    ) -> Result<(Vec<RpcLog<Eth::NetworkTypes>>, Vec<alloy_primitives::BlockHash>), EthFilterError>
+    {
         trace!(target: "rpc::eth::filter", from=from_block, to=to_block, ?filter, "finding logs in range");
 
         // perform boundary checks first
@@ -842,8 +912,10 @@ where
         from_block: u64,
         to_block: u64,
         limits: QueryLimits,
-    ) -> Result<Vec<RpcLog<Eth::NetworkTypes>>, EthFilterError> {
+    ) -> Result<(Vec<RpcLog<Eth::NetworkTypes>>, Vec<alloy_primitives::BlockHash>), EthFilterError>
+    {
         let mut all_logs = Vec::new();
+        let mut matching_log_blocks = Vec::new();
         let mut matching_headers = Vec::new();
 
         // get current chain tip to determine processing mode
@@ -894,6 +966,7 @@ where
             range_mode.next().await?
         {
             let num_hash = header.num_hash();
+            let logs_before = all_logs.len();
             append_matching_block_logs(
                 &mut all_logs,
                 self.eth_api.converter(),
@@ -905,6 +978,9 @@ where
                 &receipts,
                 false,
             )?;
+            if all_logs.len() > logs_before {
+                matching_log_blocks.push(num_hash.hash);
+            }
 
             // size check but only if range is multiple blocks, so we always return all
             // logs of a single block
@@ -932,7 +1008,7 @@ where
             }
         }
 
-        Ok(all_logs)
+        Ok((all_logs, matching_log_blocks))
     }
 }
 
@@ -982,6 +1058,10 @@ struct ActiveFilter<T, L = alloy_rpc_types_eth::Log> {
     kind: FilterKind<T>,
     /// Logs emitted by canonical reorganization events that have not been polled yet.
     reorg_logs: Vec<PendingReorgLog<L>>,
+    /// Cursor supplied by the latest unpolled reorganization notification.
+    reorg_cursor: Option<u64>,
+    /// Log-bearing blocks represented by the most recent non-empty poll response.
+    delivered_log_blocks: HashSet<alloy_primitives::BlockHash>,
 }
 
 #[derive(Debug, Clone)]
@@ -2175,7 +2255,7 @@ mod tests {
         let filter = Filter::default();
 
         // Get logs in the range - this will trigger the bloom filtering
-        let logs = eth_filter
+        let (logs, _) = eth_filter
             .inner
             .clone()
             .get_logs_in_block_range(filter, 100, 103, QueryLimits::default())
@@ -2229,6 +2309,8 @@ mod tests {
                         log: restored_log,
                     },
                 ],
+                reorg_cursor: None,
+                delivered_log_blocks: HashSet::new(),
             },
         );
 
@@ -2245,6 +2327,86 @@ mod tests {
             eth_filter.filter_changes(FilterId::Num(1)).await.unwrap(),
             FilterChanges::Empty
         ));
+    }
+
+    #[tokio::test]
+    async fn test_shortening_reorg_returns_logs_above_new_head() {
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            FixedBytes::from([1u8; 32]),
+            reth_ethereum_primitives::Block {
+                header: alloy_consensus::Header { number: 99, ..Default::default() },
+                body: Default::default(),
+            },
+        );
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let removed_hash = FixedBytes::from([7u8; 32]);
+        eth_filter.inner.active_filters.inner.lock().await.insert(
+            FilterId::Num(1),
+            ActiveFilter {
+                block: 101,
+                poll_lock: Arc::new(Mutex::new(())),
+                last_poll_timestamp: Instant::now(),
+                kind: FilterKind::Log(Box::default()),
+                reorg_logs: vec![PendingReorgLog {
+                    block_hash: removed_hash,
+                    block_number: 100,
+                    removed: true,
+                    log: alloy_rpc_types_eth::Log {
+                        block_hash: Some(removed_hash),
+                        block_number: Some(100),
+                        removed: true,
+                        ..Default::default()
+                    },
+                }],
+                reorg_cursor: Some(100),
+                delivered_log_blocks: HashSet::new(),
+            },
+        );
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(FilterId::Num(1)).await.unwrap()
+        else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_number, Some(100));
+        assert!(logs[0].removed);
+    }
+
+    #[tokio::test]
+    async fn test_shortening_reorg_rewinds_cursor_without_matching_logs() {
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            FixedBytes::from([1u8; 32]),
+            reth_ethereum_primitives::Block {
+                header: alloy_consensus::Header { number: 99, ..Default::default() },
+                body: Default::default(),
+            },
+        );
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        eth_filter.inner.active_filters.inner.lock().await.insert(
+            FilterId::Num(1),
+            ActiveFilter {
+                block: 101,
+                poll_lock: Arc::new(Mutex::new(())),
+                last_poll_timestamp: Instant::now(),
+                kind: FilterKind::Log(Box::default()),
+                reorg_logs: Vec::new(),
+                reorg_cursor: Some(100),
+                delivered_log_blocks: HashSet::new(),
+            },
+        );
+
+        assert!(matches!(
+            eth_filter.filter_changes(FilterId::Num(1)).await.unwrap(),
+            FilterChanges::Logs(logs) if logs.is_empty()
+        ));
+        let filters = eth_filter.inner.active_filters.inner.lock().await;
+        let filter = filters.get(&FilterId::Num(1)).unwrap();
+        assert_eq!(filter.block, 100);
+        assert_eq!(filter.reorg_cursor, None);
     }
 
     #[tokio::test]
@@ -2278,6 +2440,8 @@ mod tests {
                     removed: true,
                     log: alloy_rpc_types_eth::Log::default(),
                 }],
+                reorg_cursor: None,
+                delivered_log_blocks: HashSet::new(),
             },
         );
 
@@ -2329,6 +2493,8 @@ mod tests {
                 last_poll_timestamp: Instant::now(),
                 kind: FilterKind::Log(Box::default()),
                 reorg_logs: logs,
+                reorg_cursor: None,
+                delivered_log_blocks: HashSet::new(),
             },
         );
 
@@ -2372,6 +2538,8 @@ mod tests {
                 last_poll_timestamp: Instant::now(),
                 kind: FilterKind::Log(Box::default()),
                 reorg_logs: Vec::new(),
+                reorg_cursor: None,
+                delivered_log_blocks: HashSet::new(),
             },
         );
 
@@ -2442,5 +2610,28 @@ mod tests {
             logs.iter().map(|log| log.removed).collect::<Vec<_>>(),
             [true, false, true, false]
         );
+
+        // If canonical polling already returned B before the notification task ran, the reorg
+        // still reports A's removal but must not report B a second time.
+        {
+            let mut filters = eth_filter.inner.active_filters.inner.lock().await;
+            let filter = filters.get_mut(&FilterId::Num(1)).unwrap();
+            filter.delivered_log_blocks.clear();
+            filter.delivered_log_blocks.insert(block_b);
+        }
+        eth_filter
+            .watch_reorg(futures::stream::iter([CanonStateNotification::Reorg {
+                old: make_chain(block_a),
+                new: make_chain(block_b),
+            }]))
+            .await;
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(FilterId::Num(1)).await.unwrap()
+        else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_hash, Some(block_a));
+        assert!(logs[0].removed);
     }
 }
