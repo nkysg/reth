@@ -115,7 +115,15 @@ where
         mut notifications: impl Stream<Item = CanonStateNotification<Eth::Primitives>> + Unpin,
     ) {
         while let Some(notification) = notifications.next().await {
-            let CanonStateNotification::Reorg { old, new } = notification else { continue };
+            let CanonStateNotification::Reorg { old, new } = notification else {
+                // Delivery tracking is only needed until the canonical notification that a poll
+                // raced with has been observed.
+                let mut filters = self.inner.active_filters.inner.lock().await;
+                for filter in filters.values_mut() {
+                    filter.delivered_log_blocks.clear();
+                }
+                continue
+            };
             // The next canonical block that is not represented by the reorg notification. For a
             // pure revert this is the first reverted height, which is also where canonical polling
             // must resume once the chain starts growing again.
@@ -134,11 +142,8 @@ where
                     })
                     .collect::<Vec<_>>()
             };
+            let mut updates = Vec::with_capacity(filters.len());
             for (id, poll_lock, filter) in filters {
-                // Serialize notification delivery with polling. The provider can become canonical
-                // before this task is scheduled, so additions already returned by the poll that
-                // held this lock first are filtered against the delivered block set below.
-                let _poll_guard = poll_lock.lock().await;
                 let mut reorg_logs = Vec::new();
                 for (block, receipts, removed) in old
                     .blocks_and_receipts()
@@ -172,9 +177,19 @@ where
                         }
                     }
                 }
-                let mut filters = self.inner.active_filters.inner.lock().await;
-                let Some(active_filter) = filters.get_mut(&id) else { continue };
-                if Arc::ptr_eq(&active_filter.poll_lock, &poll_lock) {
+                updates.push((id, poll_lock, reorg_logs));
+            }
+            futures::stream::iter(updates)
+                .for_each_concurrent(None, |(id, poll_lock, reorg_logs)| async move {
+                    // Serialize notification delivery with polling. Applying filters concurrently
+                    // prevents one busy filter from delaying this notification for every other
+                    // filter.
+                    let _poll_guard = poll_lock.lock().await;
+                    let mut filters = self.inner.active_filters.inner.lock().await;
+                    let Some(active_filter) = filters.get_mut(&id) else { return };
+                    if !Arc::ptr_eq(&active_filter.poll_lock, &poll_lock) {
+                        return
+                    }
                     active_filter.reorg_cursor = Some(
                         active_filter
                             .reorg_cursor
@@ -184,7 +199,7 @@ where
                     // Project the block-level delivery state through already queued events. This
                     // preserves chained sequences such as A -> B -> A while suppressing an added
                     // block that a concurrent canonical poll already returned.
-                    let mut delivered = active_filter.delivered_log_blocks.clone();
+                    let mut delivered = std::mem::take(&mut active_filter.delivered_log_blocks);
                     for pending in &active_filter.reorg_logs {
                         if pending.removed {
                             delivered.remove(&pending.block_hash);
@@ -210,8 +225,8 @@ where
                             active_filter.reorg_logs.push(pending);
                         }
                     }
-                }
-            }
+                })
+                .await;
         }
     }
 }
@@ -434,6 +449,26 @@ where
                     let logs = reorg_logs.into_iter().map(|pending| pending.log).collect();
                     FilterChanges::Logs(logs)
                 } else {
+                    // `matches_block` cannot resolve dynamic tags. Keep `latest` and `pending`
+                    // open-ended for reorg events, but enforce resolved checkpoint and numeric
+                    // bounds.
+                    let (enforce_from_bound, enforce_to_bound) = match block_option {
+                        FilterBlockOption::Range { from_block, to_block } => (
+                            from_block.is_some_and(|block| {
+                                !matches!(
+                                    block,
+                                    BlockNumberOrTag::Latest | BlockNumberOrTag::Pending
+                                )
+                            }),
+                            to_block.is_some_and(|block| {
+                                !matches!(
+                                    block,
+                                    BlockNumberOrTag::Latest | BlockNumberOrTag::Pending
+                                )
+                            }),
+                        ),
+                        FilterBlockOption::AtBlockHash(_) => (false, false),
+                    };
                     let (from_block_number, to_block_number) = match block_option {
                         FilterBlockOption::Range { from_block, to_block } => {
                             let from = from_block
@@ -456,17 +491,22 @@ where
                             (block_number, block_number)
                         }
                     };
-                    let pending_logs = reorg_logs
-                        .into_iter()
-                        .filter(|pending| match block_option {
-                            FilterBlockOption::AtBlockHash(hash) => pending.block_hash == hash,
-                            FilterBlockOption::Range { .. } => {
-                                pending.removed ||
-                                    pending.block_number < from_block_number ||
-                                    pending.block_number > to_block_number
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                    let pending_logs =
+                        reorg_logs
+                            .into_iter()
+                            .filter(|pending| match block_option {
+                                FilterBlockOption::AtBlockHash(hash) => pending.block_hash == hash,
+                                FilterBlockOption::Range { .. } => {
+                                    (!enforce_from_bound ||
+                                        pending.block_number >= from_block_number) &&
+                                        (!enforce_to_bound ||
+                                            pending.block_number <= to_block_number) &&
+                                        (pending.removed ||
+                                            pending.block_number < from_block_number ||
+                                            pending.block_number > to_block_number)
+                                }
+                            })
+                            .collect::<Vec<_>>();
                     delivered_events.extend(
                         pending_logs.iter().map(|pending| (pending.block_hash, pending.removed)),
                     );
@@ -505,18 +545,14 @@ where
             if reorg_cursor == filter.reorg_cursor {
                 filter.reorg_cursor = None;
             }
-            if !delivered_events.is_empty() {
-                // Only the most recent non-empty response can race with a notification waiting on
-                // `poll_lock`. Replacing the set keeps this state bounded for long-lived filters.
-                let mut delivered_log_blocks = HashSet::new();
-                for (block_hash, removed) in delivered_events {
-                    if removed {
-                        delivered_log_blocks.remove(&block_hash);
-                    } else {
-                        delivered_log_blocks.insert(block_hash);
-                    }
+            // Multiple polls can already be queued before a notification waits on `poll_lock`, so
+            // retain every block delivered since the last canonical notification.
+            for (block_hash, removed) in delivered_events {
+                if removed {
+                    filter.delivered_log_blocks.remove(&block_hash);
+                } else {
+                    filter.delivered_log_blocks.insert(block_hash);
                 }
-                filter.delivered_log_blocks = delivered_log_blocks;
             }
         }
         Ok(changes)
