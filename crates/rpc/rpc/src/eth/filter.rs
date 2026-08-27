@@ -299,13 +299,27 @@ where
         };
         let _poll_guard = poll_lock.lock().await;
 
-        let (start_block, kind, canonical_events) = {
+        let snapshot = {
             let mut filters = self.inner.active_filters.inner.lock().await;
             let filter =
                 filters.get_mut(&id).ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
             filter.last_poll_timestamp = Instant::now();
-            (filter.block, filter.kind.clone(), filter.canonical_events.clone())
+            let snapshot = (filter.block, filter.kind.clone(), filter.canonical_events.clone());
+            #[cfg(test)]
+            let hook = filter.poll_test_hook.take();
+            #[cfg(test)]
+            let snapshot = (snapshot, hook);
+            snapshot
         };
+        #[cfg(test)]
+        let ((start_block, kind, canonical_events), hook) = snapshot;
+        #[cfg(not(test))]
+        let (start_block, kind, canonical_events) = snapshot;
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook.snapshot.notify_one();
+            hook.resume.notified().await;
+        }
         let canonical_events_len = canonical_events.len();
         let is_log_filter = matches!(&kind, FilterKind::Log(_));
 
@@ -722,6 +736,8 @@ where
                 kind,
                 canonical_events: Vec::new(),
                 first_canonical_event_id,
+                #[cfg(test)]
+                poll_test_hook: None,
             },
         );
         Ok(id)
@@ -934,6 +950,15 @@ struct ActiveFilter<T, N: NodePrimitives> {
     canonical_events: Vec<CanonStateNotification<N>>,
     /// First canonical event sequence that occurred after this filter was installed.
     first_canonical_event_id: u64,
+    #[cfg(test)]
+    poll_test_hook: Option<Arc<PollTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PollTestHook {
+    snapshot: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 /// A receiver for pending transactions that returns all new transactions since the last poll.
@@ -1480,13 +1505,16 @@ impl<
 mod tests {
     use super::*;
     use crate::{eth::EthApi, EthApiBuilder};
+    use alloy_consensus::TxLegacy;
     use alloy_network::Ethereum;
-    use alloy_primitives::FixedBytes;
+    use alloy_primitives::{Address, Bytes, FixedBytes, B256};
     use rand::Rng;
     use reth_chainspec::{ChainSpec, ChainSpecProvider};
-    use reth_ethereum_primitives::TxType;
+    use reth_ethereum_primitives::{BlockBody, EthPrimitives, Receipt, TransactionSigned, TxType};
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_execution_types::{Chain, ExecutionOutcome};
     use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::RecoveredBlock;
     use reth_provider::test_utils::MockEthProvider;
     use reth_rpc_convert::RpcConverter;
     use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
@@ -1494,7 +1522,10 @@ mod tests {
     use reth_tasks::Runtime;
     use reth_testing_utils::generators;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::Arc,
+    };
 
     #[test]
     fn test_block_range_iter() {
@@ -1533,6 +1564,51 @@ mod tests {
             EthEvmConfig::new(provider.chain_spec()),
         )
         .build()
+    }
+
+    fn test_chain(blocks: &[(B256, u64, Address, B256)]) -> Arc<Chain<EthPrimitives>> {
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy {
+                chain_id: Some(1),
+                gas_limit: 21_000,
+                to: alloy_primitives::TxKind::Call(Address::ZERO),
+                ..Default::default()
+            }
+            .into(),
+            alloy_primitives::Signature::test_signature(),
+        );
+        let recovered_blocks: Vec<_> = blocks
+            .iter()
+            .map(|(hash, number, _, _)| {
+                let block = reth_ethereum_primitives::Block {
+                    header: alloy_consensus::Header { number: *number, ..Default::default() },
+                    body: BlockBody { transactions: vec![tx.clone()], ..Default::default() },
+                };
+                let mut recovered = RecoveredBlock::new_unhashed(block, vec![Address::ZERO]);
+                recovered.set_hash(*hash);
+                recovered
+            })
+            .collect();
+        let receipts = blocks
+            .iter()
+            .map(|(_, _, address, topic)| {
+                vec![Receipt {
+                    tx_type: TxType::Legacy,
+                    cumulative_gas_used: 21_000,
+                    logs: vec![alloy_primitives::Log {
+                        address: *address,
+                        data: alloy_primitives::LogData::new_unchecked(vec![*topic], Bytes::new()),
+                    }],
+                    success: true,
+                }]
+            })
+            .collect();
+
+        Arc::new(Chain::new(
+            recovered_blocks,
+            ExecutionOutcome::new(Default::default(), receipts, blocks[0].1, Vec::new()),
+            BTreeMap::new(),
+        ))
     }
 
     #[tokio::test]
@@ -2139,12 +2215,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_rebirth() {
-        use alloy_consensus::TxLegacy;
-        use reth_ethereum_primitives::{BlockBody, Receipt, TransactionSigned};
-        use reth_execution_types::{Chain, ExecutionOutcome};
-        use reth_primitives_traits::RecoveredBlock;
-        use std::collections::BTreeMap;
-
         let provider = MockEthProvider::default();
         provider.add_block(
             FixedBytes::from([1u8; 32]),
@@ -2158,65 +2228,15 @@ mod tests {
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
-        let tx = TransactionSigned::new_unhashed(
-            TxLegacy {
-                chain_id: Some(1),
-                nonce: 0,
-                gas_price: 1,
-                gas_limit: 21_000,
-                to: alloy_primitives::TxKind::Call(alloy_primitives::Address::ZERO),
-                value: alloy_primitives::U256::ZERO,
-                input: alloy_primitives::Bytes::new(),
-            }
-            .into(),
-            alloy_primitives::Signature::test_signature(),
-        );
-        let receipt = Receipt {
-            tx_type: reth_ethereum_primitives::TxType::Legacy,
-            cumulative_gas_used: 21_000,
-            logs: vec![alloy_primitives::Log {
-                address: alloy_primitives::Address::ZERO,
-                data: alloy_primitives::LogData::new_unchecked(
-                    Vec::new(),
-                    alloy_primitives::Bytes::new(),
-                ),
-            }],
-            success: true,
-        };
-
-        let make_chain = |hash: FixedBytes<32>| {
-            let block = reth_ethereum_primitives::Block {
-                header: alloy_consensus::Header { number: 0, ..Default::default() },
-                body: BlockBody { transactions: vec![tx.clone()], ..Default::default() },
-            };
-            let mut recovered =
-                RecoveredBlock::new_unhashed(block, vec![alloy_primitives::Address::ZERO]);
-            recovered.set_hash(hash);
-            Arc::new(Chain::new(
-                vec![recovered],
-                ExecutionOutcome::new(
-                    Default::default(),
-                    vec![vec![receipt.clone()]],
-                    0,
-                    Vec::new(),
-                ),
-                BTreeMap::new(),
-            ))
-        };
-
         let block_a = FixedBytes::from([7u8; 32]);
         let block_b = FixedBytes::from([8u8; 32]);
+        let chain_a = || test_chain(&[(block_a, 0, Address::ZERO, B256::ZERO)]);
+        let chain_b = || test_chain(&[(block_b, 0, Address::ZERO, B256::ZERO)]);
         eth_filter
-            .queue_canonical_state(CanonStateNotification::Reorg {
-                old: make_chain(block_a),
-                new: make_chain(block_b),
-            })
+            .queue_canonical_state(CanonStateNotification::Reorg { old: chain_a(), new: chain_b() })
             .await;
         eth_filter
-            .queue_canonical_state(CanonStateNotification::Reorg {
-                old: make_chain(block_b),
-                new: make_chain(block_a),
-            })
+            .queue_canonical_state(CanonStateNotification::Reorg { old: chain_b(), new: chain_a() })
             .await;
 
         let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id.clone()).await.unwrap()
@@ -2238,15 +2258,266 @@ mod tests {
             FilterChanges::Logs(logs) if logs.is_empty()
         ));
 
-        eth_filter
-            .queue_canonical_state(CanonStateNotification::Commit { new: make_chain(block_b) })
-            .await;
+        eth_filter.queue_canonical_state(CanonStateNotification::Commit { new: chain_b() }).await;
         let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
             panic!("expected log changes")
         };
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].block_hash, Some(block_b));
         assert!(!logs[0].removed);
+    }
+
+    #[tokio::test]
+    async fn test_canonical_events_apply_log_filter_criteria() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let address = Address::repeat_byte(1);
+        let topic = B256::repeat_byte(2);
+        let old_hash = B256::repeat_byte(3);
+        let new_hash = B256::repeat_byte(4);
+
+        let matching = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(
+                Filter::new().select(10..=10).address(address).event_signature(topic),
+            )))
+            .await
+            .unwrap();
+        let wrong_address = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(
+                Filter::new().address(Address::repeat_byte(9)).event_signature(topic),
+            )))
+            .await
+            .unwrap();
+        let wrong_topic = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(
+                Filter::new().address(address).event_signature(B256::repeat_byte(9)),
+            )))
+            .await
+            .unwrap();
+        let old_block = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(Filter::new().at_block_hash(old_hash))))
+            .await
+            .unwrap();
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Reorg {
+                old: test_chain(&[(old_hash, 10, address, topic)]),
+                new: test_chain(&[(new_hash, 10, address, topic)]),
+            })
+            .await;
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(matching).await.unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.iter().map(|log| log.removed).collect::<Vec<_>>(), [true, false]);
+        assert!(matches!(
+            eth_filter.filter_changes(wrong_address).await.unwrap(),
+            FilterChanges::Logs(logs) if logs.is_empty()
+        ));
+        assert!(matches!(
+            eth_filter.filter_changes(wrong_topic).await.unwrap(),
+            FilterChanges::Logs(logs) if logs.is_empty()
+        ));
+        assert!(matches!(
+            eth_filter.filter_changes(old_block).await.unwrap(),
+            FilterChanges::Logs(logs) if logs.len() == 1 && logs[0].removed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_pure_revert_returns_removed_logs() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        let block_hash = B256::repeat_byte(1);
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Reorg {
+                old: test_chain(&[(block_hash, 10, Address::ZERO, B256::ZERO)]),
+                new: Arc::new(Chain::default()),
+            })
+            .await;
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_hash, Some(block_hash));
+        assert!(logs[0].removed);
+    }
+
+    #[tokio::test]
+    async fn test_deep_reorg_preserves_notification_order() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        let old_a = B256::repeat_byte(1);
+        let old_b = B256::repeat_byte(2);
+        let new_a = B256::repeat_byte(3);
+        let new_b = B256::repeat_byte(4);
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Reorg {
+                old: test_chain(&[
+                    (old_a, 10, Address::ZERO, B256::ZERO),
+                    (old_b, 11, Address::ZERO, B256::ZERO),
+                ]),
+                new: test_chain(&[
+                    (new_a, 10, Address::ZERO, B256::ZERO),
+                    (new_b, 11, Address::ZERO, B256::ZERO),
+                ]),
+            })
+            .await;
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(
+            logs.iter().map(|log| (log.block_hash, log.removed)).collect::<Vec<_>>(),
+            [(Some(old_a), true), (Some(old_b), true), (Some(new_a), false), (Some(new_b), false),]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_event_appended_during_poll_is_returned_by_next_poll() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        let first_hash = B256::repeat_byte(1);
+        let second_hash = B256::repeat_byte(2);
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(first_hash, 1, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+
+        let hook = Arc::new(PollTestHook::default());
+        eth_filter
+            .inner
+            .active_filters
+            .inner
+            .lock()
+            .await
+            .get_mut(&filter_id)
+            .unwrap()
+            .poll_test_hook = Some(hook.clone());
+        let poll_filter = eth_filter.clone();
+        let poll_id = filter_id.clone();
+        let poll = tokio::spawn(async move { poll_filter.filter_changes(poll_id).await });
+        hook.snapshot.notified().await;
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(second_hash, 2, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+        hook.resume.notify_one();
+
+        let FilterChanges::Logs(logs) = poll.await.unwrap().unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.iter().map(|log| log.block_hash).collect::<Vec<_>>(), [Some(first_hash)]);
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.iter().map(|log| log.block_hash).collect::<Vec<_>>(), [Some(second_hash)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_polls_do_not_duplicate_events() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        let block_hash = B256::repeat_byte(1);
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(block_hash, 1, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+
+        let hook = Arc::new(PollTestHook::default());
+        eth_filter
+            .inner
+            .active_filters
+            .inner
+            .lock()
+            .await
+            .get_mut(&filter_id)
+            .unwrap()
+            .poll_test_hook = Some(hook.clone());
+        let first_filter = eth_filter.clone();
+        let first_id = filter_id.clone();
+        let first = tokio::spawn(async move { first_filter.filter_changes(first_id).await });
+        hook.snapshot.notified().await;
+        let second_filter = eth_filter.clone();
+        let second_id = filter_id.clone();
+        let second = tokio::spawn(async move { second_filter.filter_changes(second_id).await });
+        hook.resume.notify_one();
+
+        let FilterChanges::Logs(first_logs) = first.await.unwrap().unwrap() else {
+            panic!("expected log changes")
+        };
+        let FilterChanges::Logs(second_logs) = second.await.unwrap().unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(first_logs.len(), 1);
+        assert_eq!(first_logs[0].block_hash, Some(block_hash));
+        assert!(second_logs.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_invalidated_filter_fails_in_flight_poll() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(B256::repeat_byte(1), 1, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+
+        let hook = Arc::new(PollTestHook::default());
+        eth_filter
+            .inner
+            .active_filters
+            .inner
+            .lock()
+            .await
+            .get_mut(&filter_id)
+            .unwrap()
+            .poll_test_hook = Some(hook.clone());
+        let poll_filter = eth_filter.clone();
+        let poll_id = filter_id.clone();
+        let poll = tokio::spawn(async move { poll_filter.filter_changes(poll_id).await });
+        hook.snapshot.notified().await;
+        eth_filter.inner.active_filters.inner.lock().await.remove(&filter_id);
+        hook.resume.notify_one();
+
+        assert!(matches!(
+            poll.await.unwrap(),
+            Err(EthFilterError::FilterNotFound(id)) if id == filter_id
+        ));
     }
 
     #[tokio::test]
