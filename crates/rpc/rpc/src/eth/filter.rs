@@ -14,7 +14,7 @@ use futures::{
 };
 use itertools::Itertools;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
-use reth_chain_state::{CanonStateNotification, CanonStateNotifications};
+use reth_chain_state::{CanonStateNotification, CanonStateNotifications, CanonStateSubscriptions};
 use reth_errors::ProviderError;
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
 use reth_rpc_eth_api::{
@@ -478,6 +478,30 @@ where
     /// let filter = EthFilter::new(eth_api, Default::default(), Runtime::test());
     /// ```
     pub fn new(eth_api: Eth, config: EthFilterConfig, task_spawner: Runtime) -> Self {
+        let notifications = eth_api.provider().subscribe_to_canonical_state();
+        Self::new_with_notifications(eth_api, config, task_spawner, notifications)
+    }
+
+    fn new_with_notifications(
+        eth_api: Eth,
+        config: EthFilterConfig,
+        task_spawner: Runtime,
+        notifications: CanonStateNotifications<Eth::Primitives>,
+    ) -> Self {
+        let eth_filter = Self::new_inner(eth_api, config, task_spawner);
+
+        let canonical_filter = eth_filter.clone();
+        eth_filter.inner.task_spawner.spawn_critical_task(
+            "eth-filters-canonical-watch",
+            async move {
+                canonical_filter.watch_canonical_state(notifications).await;
+            },
+        );
+
+        eth_filter
+    }
+
+    fn new_inner(eth_api: Eth, config: EthFilterConfig, task_spawner: Runtime) -> Self {
         let EthFilterConfig { max_blocks_per_filter, max_logs_per_response, stale_filter_ttl } =
             config;
         let (log_filter_commands, log_filter_command_rx) = mpsc::unbounded_channel();
@@ -511,6 +535,11 @@ where
         );
 
         eth_filter
+    }
+
+    #[cfg(test)]
+    fn new_for_test(eth_api: Eth, config: EthFilterConfig, task_spawner: Runtime) -> Self {
+        Self::new_inner(eth_api, config, task_spawner)
     }
 
     /// Returns all currently active filters
@@ -1913,7 +1942,7 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
 
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers = vec![];
@@ -1938,7 +1967,7 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
 
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers = vec![
@@ -2053,7 +2082,7 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
 
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers = vec![SealedHeader::new(
@@ -2120,7 +2149,7 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
 
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers = vec![
@@ -2211,7 +2240,7 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
 
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers = vec![
@@ -2279,7 +2308,7 @@ mod tests {
 
         let eth_api = build_test_eth_api(provider);
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers = vec![test_header.clone()];
@@ -2311,7 +2340,7 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
 
         let eth_filter =
-            super::EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+            super::EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_inner = eth_filter.inner;
 
         let headers: Vec<SealedHeader<alloy_consensus::Header>> = vec![];
@@ -2382,7 +2411,8 @@ mod tests {
         }
 
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let err = eth_filter
             .inner
             .clone()
@@ -2485,7 +2515,8 @@ mod tests {
             .add_block_body_indices(103, StoredBlockBodyIndices { first_tx_num: 2, tx_count: 0 });
 
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
 
         // Use default filter which will match any non-empty bloom
         let filter = Filter::default();
@@ -2520,7 +2551,8 @@ mod tests {
             },
         );
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
@@ -2568,7 +2600,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let address = Address::repeat_byte(1);
         let topic = B256::repeat_byte(2);
         let old_hash = B256::repeat_byte(3);
@@ -2631,7 +2664,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
         let chain = test_chain(&[(B256::repeat_byte(1), 1, Address::ZERO, B256::ZERO)]);
@@ -2649,7 +2683,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         let block_hash = B256::repeat_byte(1);
@@ -2674,7 +2709,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         let old_a = B256::repeat_byte(1);
@@ -2709,7 +2745,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         let first_hash = B256::repeat_byte(1);
@@ -2742,7 +2779,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         let block_hash = B256::repeat_byte(1);
@@ -2779,7 +2817,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         let block_hash = B256::repeat_byte(1);
@@ -2812,7 +2851,7 @@ mod tests {
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
         let config = EthFilterConfig::default().max_logs_per_response(1);
-        let eth_filter = EthFilter::new(eth_api, config, Runtime::test());
+        let eth_filter = EthFilter::new_for_test(eth_api, config, Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
@@ -2848,7 +2887,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         eth_filter
@@ -2878,7 +2918,8 @@ mod tests {
             },
         );
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
@@ -2902,7 +2943,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let old = eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
         eth_filter.invalidate_log_filters().await;
@@ -2917,7 +2959,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
         let (notifications, receiver) = tokio::sync::broadcast::channel(1);
@@ -2935,7 +2978,7 @@ mod tests {
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
         let config = EthFilterConfig::default().max_logs_per_response(1);
-        let eth_filter = EthFilter::new(eth_api, config, Runtime::test());
+        let eth_filter = EthFilter::new_for_test(eth_api, config, Runtime::test());
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
 
@@ -2967,7 +3010,8 @@ mod tests {
             },
         );
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
 
         eth_filter
             .queue_canonical_state(CanonStateNotification::Commit {
@@ -2987,7 +3031,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
 
         for tag in [BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized, BlockNumberOrTag::Pending]
         {
@@ -3017,7 +3062,8 @@ mod tests {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
-        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let eth_filter =
+            EthFilter::new_for_test(eth_api, EthFilterConfig::default(), Runtime::test());
         let filter_id = eth_filter
             .inner
             .install_filter(FilterKind::Log(Box::new(
