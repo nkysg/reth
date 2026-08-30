@@ -88,6 +88,9 @@ const PARALLEL_PROCESSING_THRESHOLD: usize = 1000;
 /// Default concurrency for parallel processing
 const DEFAULT_PARALLEL_CONCURRENCY: usize = 4;
 
+/// Maximum number of commands waiting for the log-filter actor.
+const LOG_FILTER_COMMAND_CAPACITY: usize = 1_024;
+
 /// `Eth` filter RPC implementation.
 ///
 /// This type handles `eth_` rpc requests related to filters (`eth_getLogs`).
@@ -115,11 +118,7 @@ enum LogFilterCommand<N: NodePrimitives, L> {
     Uninstall(FilterId),
     Poll {
         id: FilterId,
-        response: oneshot::Sender<Option<LogFilterPoll<N, L>>>,
-    },
-    Restore {
-        id: FilterId,
-        logs: Vec<L>,
+        response: oneshot::Sender<Option<LogFilterPoll<L>>>,
     },
     Canonical {
         notification: CanonStateNotification<N>,
@@ -133,23 +132,29 @@ enum LogFilterCommand<N: NodePrimitives, L> {
     },
 }
 
-/// A log-filter poll result that restores its logs if the receiving RPC future is cancelled.
-struct LogFilterPoll<N: NodePrimitives, L> {
-    id: FilterId,
-    logs: Option<Vec<L>>,
-    commands: mpsc::UnboundedSender<LogFilterCommand<N, L>>,
+/// Completion messages that must remain sendable when an RPC future is dropped.
+enum LogFilterCompletion<L> {
+    Restore { id: FilterId, logs: Vec<L> },
 }
 
-impl<N: NodePrimitives, L> LogFilterPoll<N, L> {
+/// A log-filter poll result that restores its logs if the receiving RPC future is cancelled.
+struct LogFilterPoll<L> {
+    id: FilterId,
+    logs: Option<Vec<L>>,
+    completions: mpsc::UnboundedSender<LogFilterCompletion<L>>,
+}
+
+impl<L> LogFilterPoll<L> {
     fn into_logs(mut self) -> Vec<L> {
         self.logs.take().unwrap_or_default()
     }
 }
 
-impl<N: NodePrimitives, L> Drop for LogFilterPoll<N, L> {
+impl<L> Drop for LogFilterPoll<L> {
     fn drop(&mut self) {
         if let Some(logs) = self.logs.take() {
-            let _ = self.commands.send(LogFilterCommand::Restore { id: self.id.clone(), logs });
+            let _ =
+                self.completions.send(LogFilterCompletion::Restore { id: self.id.clone(), logs });
         }
     }
 }
@@ -245,6 +250,7 @@ where
             .inner
             .log_filter_commands
             .send(LogFilterCommand::Canonical { notification, processed })
+            .await
             .is_ok()
         {
             let _ = rx.await;
@@ -302,28 +308,75 @@ where
 
     async fn invalidate_log_filters(&self) {
         let (processed, rx) = oneshot::channel();
-        if self.inner.log_filter_commands.send(LogFilterCommand::Invalidate { processed }).is_ok() {
+        if self
+            .inner
+            .log_filter_commands
+            .send(LogFilterCommand::Invalidate { processed })
+            .await
+            .is_ok()
+        {
             let _ = rx.await;
         }
     }
 
     async fn close_log_filters(&self) {
         let (processed, rx) = oneshot::channel();
-        if self.inner.log_filter_commands.send(LogFilterCommand::Close { processed }).is_ok() {
+        if self.inner.log_filter_commands.send(LogFilterCommand::Close { processed }).await.is_ok()
+        {
             let _ = rx.await;
+        }
+    }
+
+    async fn restore_log_filter(
+        &self,
+        filters: &mut HashMap<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>,
+        id: FilterId,
+        mut logs: Vec<RpcLog<Eth::NetworkTypes>>,
+    ) {
+        let overflow = filters.get(&id).is_some_and(|filter| {
+            self.inner
+                .query_limits
+                .max_logs_per_response
+                .is_some_and(|limit| logs.len().saturating_add(filter.logs.len()) > limit)
+        });
+        if overflow {
+            filters.remove(&id);
+            self.inner.active_filters.inner.lock().await.remove(&id);
+            warn!(
+                target: "rpc::eth::filter",
+                ?id,
+                "restored log filter backlog exceeded configured limit"
+            );
+        } else if let Some(filter) = filters.get_mut(&id) {
+            logs.append(&mut filter.logs);
+            filter.logs = logs;
         }
     }
 
     async fn run_log_filter_actor(
         self,
-        mut commands: mpsc::UnboundedReceiver<
+        mut commands: mpsc::Receiver<
             LogFilterCommand<EthPrimitives<Eth>, RpcLog<Eth::NetworkTypes>>,
         >,
+        mut completions: mpsc::UnboundedReceiver<LogFilterCompletion<RpcLog<Eth::NetworkTypes>>>,
     ) {
         let mut filters = HashMap::<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>::new();
         let mut closed = false;
 
-        while let Some(command) = commands.recv().await {
+        loop {
+            let command = tokio::select! {
+                biased;
+                Some(completion) = completions.recv() => {
+                    match completion {
+                        LogFilterCompletion::Restore { id, logs } => {
+                            self.restore_log_filter(&mut filters, id, logs).await;
+                        }
+                    }
+                    continue
+                }
+                command = commands.recv() => command,
+            };
+            let Some(command) = command else { break };
             match command {
                 LogFilterCommand::Install { id, filter, response } => {
                     if closed {
@@ -348,29 +401,10 @@ where
                     let poll = LogFilterPoll {
                         id: id.clone(),
                         logs: Some(logs),
-                        commands: self.inner.log_filter_commands.clone(),
+                        completions: self.inner.log_filter_completions.clone(),
                     };
                     if let Err(Some(mut poll)) = response.send(Some(poll)) {
                         filter.logs = poll.logs.take().unwrap_or_default();
-                    }
-                }
-                LogFilterCommand::Restore { id, mut logs } => {
-                    let overflow = filters.get(&id).is_some_and(|filter| {
-                        self.inner.query_limits.max_logs_per_response.is_some_and(|limit| {
-                            logs.len().saturating_add(filter.logs.len()) > limit
-                        })
-                    });
-                    if overflow {
-                        filters.remove(&id);
-                        self.inner.active_filters.inner.lock().await.remove(&id);
-                        warn!(
-                            target: "rpc::eth::filter",
-                            ?id,
-                            "restored log filter backlog exceeded configured limit"
-                        );
-                    } else if let Some(filter) = filters.get_mut(&id) {
-                        logs.append(&mut filter.logs);
-                        filter.logs = logs;
                     }
                 }
                 LogFilterCommand::Canonical { notification, processed } => {
@@ -510,11 +544,14 @@ where
     fn new_inner(eth_api: Eth, config: EthFilterConfig, task_spawner: Runtime) -> Self {
         let EthFilterConfig { max_blocks_per_filter, max_logs_per_response, stale_filter_ttl } =
             config;
-        let (log_filter_commands, log_filter_command_rx) = mpsc::unbounded_channel();
+        let (log_filter_commands, log_filter_command_rx) =
+            mpsc::channel(LOG_FILTER_COMMAND_CAPACITY);
+        let (log_filter_completions, log_filter_completion_rx) = mpsc::unbounded_channel();
         let inner = EthFilterInner {
             eth_api,
             active_filters: ActiveFilters::new(),
             log_filter_commands,
+            log_filter_completions,
             id_provider: Arc::new(EthSubscriptionIdProvider::default()),
             max_headers_range: MAX_HEADERS_RANGE,
             task_spawner,
@@ -528,7 +565,9 @@ where
         eth_filter.inner.task_spawner.spawn_critical_task(
             "eth-filters-log-filter-actor",
             async move {
-                log_filter_actor.run_log_filter_actor(log_filter_command_rx).await;
+                log_filter_actor
+                    .run_log_filter_actor(log_filter_command_rx, log_filter_completion_rx)
+                    .await;
             },
         );
 
@@ -588,7 +627,7 @@ where
         filters.shrink_to_fit();
         drop(filters);
         for id in stale_log_filters {
-            let _ = self.inner.log_filter_commands.send(LogFilterCommand::Uninstall(id));
+            let _ = self.inner.log_filter_commands.send(LogFilterCommand::Uninstall(id)).await;
         }
     }
 }
@@ -639,6 +678,7 @@ where
             self.inner
                 .log_filter_commands
                 .send(LogFilterCommand::Poll { id: id.clone(), response })
+                .await
                 .map_err(|_| EthFilterError::CanonicalStateStreamClosed)?;
             return match rx.await.map_err(|_| EthFilterError::CanonicalStateStreamClosed)? {
                 Some(poll) => Ok(FilterChanges::Logs(poll.into_logs())),
@@ -816,18 +856,26 @@ where
     /// Handler for `eth_uninstallFilter`
     async fn uninstall_filter(&self, id: FilterId) -> RpcResult<bool> {
         trace!(target: "rpc::eth", "Serving eth_uninstallFilter");
-        let mut filters = self.inner.active_filters.inner.lock().await;
-        if let Some(filter) = filters.remove(&id) {
-            drop(filters);
-            if matches!(filter.kind, FilterKind::Log(_)) {
-                let _ =
-                    self.inner.log_filter_commands.send(LogFilterCommand::Uninstall(id.clone()));
-            }
-            trace!(target: "rpc::eth::filter", ?id, "uninstalled filter");
-            Ok(true)
+        let is_log_filter = {
+            let filters = self.inner.active_filters.inner.lock().await;
+            let Some(filter) = filters.get(&id) else { return Ok(false) };
+            matches!(filter.kind, FilterKind::Log(_))
+        };
+        let uninstall_permit = if is_log_filter {
+            self.inner.log_filter_commands.clone().reserve_owned().await.ok()
         } else {
-            Ok(false)
+            None
+        };
+
+        let removed = self.inner.active_filters.inner.lock().await.remove(&id);
+        let Some(filter) = removed else { return Ok(false) };
+        if matches!(filter.kind, FilterKind::Log(_)) &&
+            let Some(permit) = uninstall_permit
+        {
+            permit.send(LogFilterCommand::Uninstall(id.clone()));
         }
+        trace!(target: "rpc::eth::filter", ?id, "uninstalled filter");
+        Ok(true)
     }
 
     /// Returns logs matching given filter object.
@@ -857,7 +905,9 @@ struct EthFilterInner<Eth: EthApiTypes> {
     active_filters: ActiveFilters<RpcTransaction<Eth::NetworkTypes>>,
     /// Ordered command stream for installed log filters.
     log_filter_commands:
-        mpsc::UnboundedSender<LogFilterCommand<EthPrimitives<Eth>, RpcLog<Eth::NetworkTypes>>>,
+        mpsc::Sender<LogFilterCommand<EthPrimitives<Eth>, RpcLog<Eth::NetworkTypes>>>,
+    /// Poll completion stream, which remains non-blocking for cancelled RPC futures.
+    log_filter_completions: mpsc::UnboundedSender<LogFilterCompletion<RpcLog<Eth::NetworkTypes>>>,
     /// Provides ids to identify filters
     id_provider: Arc<dyn IdProvider>,
     /// limits for logs queries
@@ -1043,6 +1093,17 @@ where
             FilterKind::Log(filter) => Some(filter.clone()),
             _ => None,
         };
+        let install_permit = if log_filter.is_some() {
+            Some(
+                self.log_filter_commands
+                    .clone()
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| EthFilterError::CanonicalStateStreamClosed)?,
+            )
+        } else {
+            None
+        };
         let mut filters = self.active_filters.inner.lock().await;
         filters.insert(
             id.clone(),
@@ -1057,14 +1118,9 @@ where
 
         if let Some(filter) = log_filter {
             let (response, rx) = oneshot::channel();
-            if self
-                .log_filter_commands
-                .send(LogFilterCommand::Install { id: id.clone(), filter, response })
-                .is_err()
-            {
-                self.active_filters.inner.lock().await.remove(&id);
-                return Err(EthFilterError::CanonicalStateStreamClosed.into())
-            }
+            install_permit
+                .expect("log filter reserves actor command capacity")
+                .send(LogFilterCommand::Install { id: id.clone(), filter, response });
             match rx.await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -2840,6 +2896,7 @@ mod tests {
             .inner
             .log_filter_commands
             .send(LogFilterCommand::Poll { id: filter_id.clone(), response })
+            .await
             .unwrap();
         let delivery = rx.await.unwrap().unwrap();
         drop(delivery);
@@ -2872,6 +2929,7 @@ mod tests {
             .inner
             .log_filter_commands
             .send(LogFilterCommand::Poll { id: filter_id.clone(), response })
+            .await
             .unwrap();
         let delivery = rx.await.unwrap().unwrap();
 
