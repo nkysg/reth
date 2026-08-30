@@ -251,12 +251,12 @@ where
         }
     }
 
-    /// Converts a canonical notification into lightweight ordered log events once, before they
-    /// are distributed to matching filters.
-    fn canonical_logs(
+    /// Converts and distributes a canonical notification one block at a time.
+    fn distribute_canonical_notification(
         &self,
+        filters: &mut HashMap<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>,
         notification: &CanonStateNotification<Eth::Primitives>,
-    ) -> Result<Vec<CanonicalLogEvent<RpcLog<Eth::NetworkTypes>>>, EthFilterError> {
+    ) -> Result<Vec<FilterId>, EthFilterError> {
         let reverted = notification.reverted();
         let committed = notification.committed();
         let blocks = reverted
@@ -267,8 +267,7 @@ where
             .chain(
                 committed.blocks_and_receipts().map(|(block, receipts)| (block, receipts, false)),
             );
-        let mut canonical_logs = Vec::new();
-
+        let mut invalid = Vec::new();
         for (block, receipts, removed) in blocks {
             let rpc_logs = logs_utils::matching_block_logs_with_tx_hashes(
                 self.inner.eth_api.converter(),
@@ -288,15 +287,17 @@ where
                 .zip(receipts.iter())
                 .flat_map(|(_, receipt)| receipt.logs().iter().cloned());
             let block = block.sealed_header().num_hash();
-
-            canonical_logs.extend(raw_logs.zip(rpc_logs).map(|(inner, rpc)| CanonicalLogEvent {
-                block,
-                inner,
-                rpc,
-            }));
+            let logs = raw_logs
+                .zip(rpc_logs)
+                .map(|(inner, rpc)| CanonicalLogEvent { block, inner, rpc })
+                .collect::<Vec<_>>();
+            invalid.extend(self.distribute_canonical_logs(filters, &logs));
+            if filters.is_empty() {
+                break
+            }
         }
 
-        Ok(canonical_logs)
+        Ok(invalid)
     }
 
     async fn invalidate_log_filters(&self) {
@@ -374,8 +375,14 @@ where
                 }
                 LogFilterCommand::Canonical { notification, processed } => {
                     if !filters.is_empty() {
-                        match self.canonical_logs(&notification) {
-                            Ok(logs) => self.distribute_canonical_logs(&mut filters, &logs).await,
+                        match self.distribute_canonical_notification(&mut filters, &notification) {
+                            Ok(invalid) if !invalid.is_empty() => {
+                                let mut active = self.inner.active_filters.inner.lock().await;
+                                for id in invalid {
+                                    active.remove(&id);
+                                }
+                            }
+                            Ok(_) => {}
                             Err(err) => {
                                 error!(
                                     target: "rpc::eth::filter",
@@ -401,11 +408,11 @@ where
         }
     }
 
-    async fn distribute_canonical_logs(
+    fn distribute_canonical_logs(
         &self,
         filters: &mut HashMap<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>,
         logs: &[CanonicalLogEvent<RpcLog<Eth::NetworkTypes>>],
-    ) {
+    ) -> Vec<FilterId> {
         let limit = self.inner.query_limits.max_logs_per_response;
         let mut invalid = Vec::new();
 
@@ -423,15 +430,14 @@ where
         }
 
         if invalid.is_empty() {
-            return
+            return invalid
         }
 
-        let mut active = self.inner.active_filters.inner.lock().await;
-        for id in invalid {
-            filters.remove(&id);
-            active.remove(&id);
+        for id in &invalid {
+            filters.remove(id);
             warn!(target: "rpc::eth::filter", ?id, "log filter backlog exceeded configured limit");
         }
+        invalid
     }
 
     async fn invalidate_managed_log_filters(
