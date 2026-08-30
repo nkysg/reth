@@ -354,7 +354,20 @@ where
                     }
                 }
                 LogFilterCommand::Restore { id, mut logs } => {
-                    if let Some(filter) = filters.get_mut(&id) {
+                    let overflow = filters.get(&id).is_some_and(|filter| {
+                        self.inner.query_limits.max_logs_per_response.is_some_and(|limit| {
+                            logs.len().saturating_add(filter.logs.len()) > limit
+                        })
+                    });
+                    if overflow {
+                        filters.remove(&id);
+                        self.inner.active_filters.inner.lock().await.remove(&id);
+                        warn!(
+                            target: "rpc::eth::filter",
+                            ?id,
+                            "restored log filter backlog exceeded configured limit"
+                        );
+                    } else if let Some(filter) = filters.get_mut(&id) {
                         logs.append(&mut filter.logs);
                         filter.logs = logs;
                     }
@@ -2791,6 +2804,43 @@ mod tests {
         };
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].block_hash, Some(block_hash));
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_poll_restore_respects_backlog_limit() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let config = EthFilterConfig::default().max_logs_per_response(1);
+        let eth_filter = EthFilter::new(eth_api, config, Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(B256::repeat_byte(1), 1, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+
+        let (response, rx) = oneshot::channel();
+        eth_filter
+            .inner
+            .log_filter_commands
+            .send(LogFilterCommand::Poll { id: filter_id.clone(), response })
+            .unwrap();
+        let delivery = rx.await.unwrap().unwrap();
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(B256::repeat_byte(2), 2, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+        drop(delivery);
+
+        assert!(matches!(
+            eth_filter.filter_changes(filter_id.clone()).await,
+            Err(EthFilterError::FilterNotFound(id)) if id == filter_id
+        ));
     }
 
     #[tokio::test]
