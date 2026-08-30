@@ -82,7 +82,8 @@ pub struct EthConfig {
     pub max_trace_filter_blocks: u64,
     /// Maximum number of blocks that could be scanned per filter request in `eth_getLogs` calls.
     pub max_blocks_per_filter: u64,
-    /// Maximum number of logs that can be returned in a single response in `eth_getLogs` calls.
+    /// Maximum number of logs that can be returned in a single response and queued by an installed
+    /// log filter.
     pub max_logs_per_response: usize,
     /// Gas limit for `eth_call` and call tracing RPC methods.
     ///
@@ -290,8 +291,8 @@ impl EthFilterConfig {
         self
     }
 
-    /// Sets the maximum number of logs that can be returned in a single response in `eth_getLogs`
-    /// calls.
+    /// Sets the maximum number of logs that can be returned in a single response and queued by an
+    /// installed log filter.
     pub const fn max_logs_per_response(mut self, num: usize) -> Self {
         self.max_logs_per_response = Some(num);
         self

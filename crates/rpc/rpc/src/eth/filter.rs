@@ -1,8 +1,8 @@
 //! `eth_` `Filter` RPC handler implementation
 
-use alloy_consensus::{transaction::TxHashRef, BlockHeader};
-use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Sealable, TxHash};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
+use alloy_eips::{BlockNumHash, BlockNumberOrTag};
+use alloy_primitives::{Log, Sealable, TxHash};
 use alloy_rpc_types_eth::{
     Filter, FilterBlockOption, FilterChanges, FilterId, PendingTransactionFilterKind,
 };
@@ -39,19 +39,14 @@ use std::{
     iter::{Peekable, StepBy},
     ops::RangeInclusive,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{broadcast::error::RecvError, mpsc::Receiver, oneshot, Mutex},
+    sync::{broadcast::error::RecvError, mpsc, mpsc::Receiver, oneshot, Mutex},
     time::MissedTickBehavior,
 };
 use tracing::{debug, error, trace, warn};
-
-type EthPrimitives<Eth> = <<Eth as EthApiTypes>::RpcConvert as RpcConvert>::Primitives;
 
 impl<Eth> EngineEthFilter<RpcLog<Eth::NetworkTypes>> for EthFilter<Eth>
 where
@@ -101,6 +96,109 @@ pub struct EthFilter<Eth: EthApiTypes> {
     inner: Arc<EthFilterInner<Eth>>,
 }
 
+type EthPrimitives<Eth> = <<Eth as EthApiTypes>::RpcConvert as RpcConvert>::Primitives;
+
+/// A converted canonical log together with the data needed for filter matching.
+struct CanonicalLogEvent<L> {
+    block: BlockNumHash,
+    inner: Log,
+    rpc: L,
+}
+
+/// Commands handled by the single owner of installed log-filter state.
+enum LogFilterCommand<N: NodePrimitives, L> {
+    Install {
+        id: FilterId,
+        filter: Box<Filter>,
+        response: oneshot::Sender<Result<(), EthFilterError>>,
+    },
+    Uninstall(FilterId),
+    Poll {
+        id: FilterId,
+        response: oneshot::Sender<Option<LogFilterPoll<N, L>>>,
+    },
+    Restore {
+        id: FilterId,
+        logs: Vec<L>,
+    },
+    Canonical {
+        notification: CanonStateNotification<N>,
+        processed: oneshot::Sender<()>,
+    },
+    Invalidate {
+        processed: oneshot::Sender<()>,
+    },
+    Close {
+        processed: oneshot::Sender<()>,
+    },
+}
+
+/// A log-filter poll result that restores its logs if the receiving RPC future is cancelled.
+struct LogFilterPoll<N: NodePrimitives, L> {
+    id: FilterId,
+    logs: Option<Vec<L>>,
+    commands: mpsc::UnboundedSender<LogFilterCommand<N, L>>,
+}
+
+impl<N: NodePrimitives, L> LogFilterPoll<N, L> {
+    fn into_logs(mut self) -> Vec<L> {
+        self.logs.take().unwrap_or_default()
+    }
+}
+
+impl<N: NodePrimitives, L> Drop for LogFilterPoll<N, L> {
+    fn drop(&mut self) {
+        if let Some(logs) = self.logs.take() {
+            let _ = self.commands.send(LogFilterCommand::Restore { id: self.id.clone(), logs });
+        }
+    }
+}
+
+struct ManagedLogFilter<L> {
+    filter: Box<Filter>,
+    logs: Vec<L>,
+}
+
+fn has_unsupported_dynamic_block_tag(filter: &Filter) -> bool {
+    let FilterBlockOption::Range { from_block, to_block } = filter.block_option else {
+        return false
+    };
+    [from_block, to_block].into_iter().flatten().any(|tag| {
+        matches!(
+            tag,
+            BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized | BlockNumberOrTag::Pending
+        )
+    })
+}
+
+fn matches_canonical_block(filter: &Filter, block: &BlockNumHash) -> bool {
+    match filter.block_option {
+        FilterBlockOption::AtBlockHash(hash) => hash == block.hash,
+        FilterBlockOption::Range { from_block, to_block } => {
+            let from_matches = match from_block {
+                Some(BlockNumberOrTag::Number(number)) => block.number >= number,
+                Some(
+                    BlockNumberOrTag::Safe |
+                    BlockNumberOrTag::Finalized |
+                    BlockNumberOrTag::Pending,
+                ) => false,
+                Some(BlockNumberOrTag::Earliest | BlockNumberOrTag::Latest) | None => true,
+            };
+            let to_matches = match to_block {
+                Some(BlockNumberOrTag::Number(number)) => block.number <= number,
+                Some(BlockNumberOrTag::Earliest) => block.number == 0,
+                Some(
+                    BlockNumberOrTag::Safe |
+                    BlockNumberOrTag::Finalized |
+                    BlockNumberOrTag::Pending,
+                ) => false,
+                Some(BlockNumberOrTag::Latest) | None => true,
+            };
+            from_matches && to_matches
+        }
+    }
+}
+
 impl<Eth> Clone for EthFilter<Eth>
 where
     Eth: EthApiTypes,
@@ -114,7 +212,7 @@ impl<Eth> EthFilter<Eth>
 where
     Eth: FullEthApiTypes + 'static,
 {
-    /// Queues canonical chain events for installed log filters.
+    /// Forwards canonical notifications into the ordered log-filter actor.
     pub async fn watch_canonical_state(
         &self,
         mut notifications: CanonStateNotifications<Eth::Primitives>,
@@ -130,43 +228,214 @@ where
                         skipped,
                         "canonical state notification stream lagged; invalidating log filters"
                     );
-                    self.inner
-                        .active_filters
-                        .inner
-                        .lock()
-                        .await
-                        .retain(|_, filter| !matches!(filter.kind, FilterKind::Log(_)));
+                    self.invalidate_log_filters().await;
                 }
-                Err(RecvError::Closed) => break,
+                Err(RecvError::Closed) => {
+                    self.close_log_filters().await;
+                    break
+                }
             }
         }
     }
 
-    /// Adds one canonical event to every currently installed log filter.
+    /// Adds one canonical event to the ordered log-filter actor.
     async fn queue_canonical_state(&self, notification: CanonStateNotification<Eth::Primitives>) {
-        let event_id = self.inner.next_canonical_event_id.fetch_add(1, Ordering::SeqCst);
-        self.queue_canonical_state_at(event_id, notification).await;
+        let (processed, rx) = oneshot::channel();
+        if self
+            .inner
+            .log_filter_commands
+            .send(LogFilterCommand::Canonical { notification, processed })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
     }
 
-    async fn queue_canonical_state_at(
+    /// Converts a canonical notification into lightweight ordered log events once, before they
+    /// are distributed to matching filters.
+    fn canonical_logs(
         &self,
-        event_id: u64,
-        notification: CanonStateNotification<Eth::Primitives>,
+        notification: &CanonStateNotification<Eth::Primitives>,
+    ) -> Result<Vec<CanonicalLogEvent<RpcLog<Eth::NetworkTypes>>>, EthFilterError> {
+        let reverted = notification.reverted();
+        let committed = notification.committed();
+        let blocks = reverted
+            .iter()
+            .flat_map(|chain| {
+                chain.blocks_and_receipts().map(|(block, receipts)| (block, receipts, true))
+            })
+            .chain(
+                committed.blocks_and_receipts().map(|(block, receipts)| (block, receipts, false)),
+            );
+        let mut canonical_logs = Vec::new();
+
+        for (block, receipts, removed) in blocks {
+            let rpc_logs = logs_utils::matching_block_logs_with_tx_hashes(
+                self.inner.eth_api.converter(),
+                &Filter::default(),
+                block.sealed_header(),
+                block
+                    .transactions_recovered()
+                    .zip(receipts.iter())
+                    .map(|(tx, receipt)| (*tx.tx_hash(), receipt)),
+                removed,
+            )
+            .map_err(|err| {
+                EthApiError::other(Into::<jsonrpsee::types::ErrorObject<'static>>::into(err))
+            })?;
+            let raw_logs = block
+                .transactions_recovered()
+                .zip(receipts.iter())
+                .flat_map(|(_, receipt)| receipt.logs().iter().cloned());
+            let block = block.sealed_header().num_hash();
+
+            canonical_logs.extend(raw_logs.zip(rpc_logs).map(|(inner, rpc)| CanonicalLogEvent {
+                block,
+                inner,
+                rpc,
+            }));
+        }
+
+        Ok(canonical_logs)
+    }
+
+    async fn invalidate_log_filters(&self) {
+        let (processed, rx) = oneshot::channel();
+        if self.inner.log_filter_commands.send(LogFilterCommand::Invalidate { processed }).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    async fn close_log_filters(&self) {
+        let (processed, rx) = oneshot::channel();
+        if self.inner.log_filter_commands.send(LogFilterCommand::Close { processed }).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    async fn run_log_filter_actor(
+        self,
+        mut commands: mpsc::UnboundedReceiver<
+            LogFilterCommand<EthPrimitives<Eth>, RpcLog<Eth::NetworkTypes>>,
+        >,
     ) {
-        let mut filters = self.inner.active_filters.inner.lock().await;
-        for filter in filters.values_mut() {
-            if matches!(filter.kind, FilterKind::Log(_)) &&
-                event_id >= filter.first_canonical_event_id
-            {
-                filter.canonical_events.push(notification.clone());
+        let mut filters = HashMap::<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>::new();
+        let mut closed = false;
+
+        while let Some(command) = commands.recv().await {
+            match command {
+                LogFilterCommand::Install { id, filter, response } => {
+                    if closed {
+                        let _ = response.send(Err(EthFilterError::CanonicalStateStreamClosed));
+                        continue
+                    }
+                    filters.insert(id.clone(), ManagedLogFilter { filter, logs: Vec::new() });
+                    if response.send(Ok(())).is_err() {
+                        filters.remove(&id);
+                        self.inner.active_filters.inner.lock().await.remove(&id);
+                    }
+                }
+                LogFilterCommand::Uninstall(id) => {
+                    filters.remove(&id);
+                }
+                LogFilterCommand::Poll { id, response } => {
+                    let Some(filter) = filters.get_mut(&id) else {
+                        let _ = response.send(None);
+                        continue
+                    };
+                    let logs = std::mem::take(&mut filter.logs);
+                    let poll = LogFilterPoll {
+                        id: id.clone(),
+                        logs: Some(logs),
+                        commands: self.inner.log_filter_commands.clone(),
+                    };
+                    if let Err(Some(mut poll)) = response.send(Some(poll)) {
+                        filter.logs = poll.logs.take().unwrap_or_default();
+                    }
+                }
+                LogFilterCommand::Restore { id, mut logs } => {
+                    if let Some(filter) = filters.get_mut(&id) {
+                        logs.append(&mut filter.logs);
+                        filter.logs = logs;
+                    }
+                }
+                LogFilterCommand::Canonical { notification, processed } => {
+                    if !filters.is_empty() {
+                        match self.canonical_logs(&notification) {
+                            Ok(logs) => self.distribute_canonical_logs(&mut filters, &logs).await,
+                            Err(err) => {
+                                error!(
+                                    target: "rpc::eth::filter",
+                                    %err,
+                                    "failed to convert canonical logs; invalidating log filters"
+                                );
+                                self.invalidate_managed_log_filters(&mut filters).await;
+                            }
+                        }
+                    }
+                    let _ = processed.send(());
+                }
+                LogFilterCommand::Invalidate { processed } => {
+                    self.invalidate_managed_log_filters(&mut filters).await;
+                    let _ = processed.send(());
+                }
+                LogFilterCommand::Close { processed } => {
+                    closed = true;
+                    self.invalidate_managed_log_filters(&mut filters).await;
+                    let _ = processed.send(());
+                }
             }
         }
+    }
+
+    async fn distribute_canonical_logs(
+        &self,
+        filters: &mut HashMap<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>,
+        logs: &[CanonicalLogEvent<RpcLog<Eth::NetworkTypes>>],
+    ) {
+        let limit = self.inner.query_limits.max_logs_per_response;
+        let mut invalid = Vec::new();
+
+        for (id, filter) in filters.iter_mut() {
+            for event in logs.iter().filter(|event| {
+                matches_canonical_block(&filter.filter, &event.block) &&
+                    filter.filter.matches(&event.inner)
+            }) {
+                if limit.is_some_and(|limit| filter.logs.len() >= limit) {
+                    invalid.push(id.clone());
+                    break
+                }
+                filter.logs.push(event.rpc.clone());
+            }
+        }
+
+        if invalid.is_empty() {
+            return
+        }
+
+        let mut active = self.inner.active_filters.inner.lock().await;
+        for id in invalid {
+            filters.remove(&id);
+            active.remove(&id);
+            warn!(target: "rpc::eth::filter", ?id, "log filter backlog exceeded configured limit");
+        }
+    }
+
+    async fn invalidate_managed_log_filters(
+        &self,
+        filters: &mut HashMap<FilterId, ManagedLogFilter<RpcLog<Eth::NetworkTypes>>>,
+    ) {
+        let mut active = self.inner.active_filters.inner.lock().await;
+        for id in filters.keys() {
+            active.remove(id);
+        }
+        filters.clear();
     }
 }
 
 impl<Eth> EthFilter<Eth>
 where
-    Eth: EthApiTypes + 'static,
+    Eth: FullEthApiTypes + 'static,
 {
     /// Creates a new, shareable instance.
     ///
@@ -198,10 +467,11 @@ where
     pub fn new(eth_api: Eth, config: EthFilterConfig, task_spawner: Runtime) -> Self {
         let EthFilterConfig { max_blocks_per_filter, max_logs_per_response, stale_filter_ttl } =
             config;
+        let (log_filter_commands, log_filter_command_rx) = mpsc::unbounded_channel();
         let inner = EthFilterInner {
             eth_api,
             active_filters: ActiveFilters::new(),
-            next_canonical_event_id: AtomicU64::new(0),
+            log_filter_commands,
             id_provider: Arc::new(EthSubscriptionIdProvider::default()),
             max_headers_range: MAX_HEADERS_RANGE,
             task_spawner,
@@ -210,6 +480,14 @@ where
         };
 
         let eth_filter = Self { inner: Arc::new(inner) };
+
+        let log_filter_actor = eth_filter.clone();
+        eth_filter.inner.task_spawner.spawn_critical_task(
+            "eth-filters-log-filter-actor",
+            async move {
+                log_filter_actor.run_log_filter_actor(log_filter_command_rx).await;
+            },
+        );
 
         let this = eth_filter.clone();
         eth_filter.inner.task_spawner.spawn_critical_task(
@@ -223,9 +501,7 @@ where
     }
 
     /// Returns all currently active filters
-    pub fn active_filters(
-        &self,
-    ) -> &ActiveFilters<RpcTransaction<Eth::NetworkTypes>, EthPrimitives<Eth>> {
+    pub fn active_filters(&self) -> &ActiveFilters<RpcTransaction<Eth::NetworkTypes>> {
         &self.inner.active_filters
     }
 
@@ -248,16 +524,24 @@ where
     pub async fn clear_stale_filters(&self, now: Instant) {
         trace!(target: "rpc::eth", "clear stale filters");
         let mut filters = self.active_filters().inner.lock().await;
+        let mut stale_log_filters = Vec::new();
         filters.retain(|id, filter| {
             let is_valid = (now - filter.last_poll_timestamp) < self.inner.stale_filter_ttl;
 
             if !is_valid {
                 trace!(target: "rpc::eth", "evict filter with id: {:?}", id);
+                if matches!(filter.kind, FilterKind::Log(_)) {
+                    stale_log_filters.push(id.clone());
+                }
             }
 
             is_valid
         });
         filters.shrink_to_fit();
+        drop(filters);
+        for id in stale_log_filters {
+            let _ = self.inner.log_filter_commands.send(LogFilterCommand::Uninstall(id));
+        }
     }
 }
 
@@ -287,6 +571,36 @@ where
         FilterChanges<RpcTransaction<Eth::NetworkTypes>, RpcLog<Eth::NetworkTypes>>,
         EthFilterError,
     > {
+        let log_poll_lock = {
+            let mut filters = self.inner.active_filters.inner.lock().await;
+            let filter =
+                filters.get_mut(&id).ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
+            matches!(filter.kind, FilterKind::Log(_)).then(|| filter.poll_lock.clone())
+        };
+        if let Some(poll_lock) = log_poll_lock {
+            let _poll_guard = poll_lock.lock().await;
+            {
+                let mut filters = self.inner.active_filters.inner.lock().await;
+                let filter = filters
+                    .get_mut(&id)
+                    .filter(|filter| Arc::ptr_eq(&filter.poll_lock, &poll_lock))
+                    .ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
+                filter.last_poll_timestamp = Instant::now();
+            }
+            let (response, rx) = oneshot::channel();
+            self.inner
+                .log_filter_commands
+                .send(LogFilterCommand::Poll { id: id.clone(), response })
+                .map_err(|_| EthFilterError::CanonicalStateStreamClosed)?;
+            return match rx.await.map_err(|_| EthFilterError::CanonicalStateStreamClosed)? {
+                Some(poll) => Ok(FilterChanges::Logs(poll.into_logs())),
+                None => {
+                    self.inner.active_filters.inner.lock().await.remove(&id);
+                    Err(EthFilterError::FilterNotFound(id))
+                }
+            }
+        }
+
         // Serialize polls for this filter so the snapshotted state can be committed after the
         // response is built successfully.
         let poll_lock = {
@@ -304,25 +618,9 @@ where
             let filter =
                 filters.get_mut(&id).ok_or_else(|| EthFilterError::FilterNotFound(id.clone()))?;
             filter.last_poll_timestamp = Instant::now();
-            let snapshot = (filter.block, filter.kind.clone(), filter.canonical_events.clone());
-            #[cfg(test)]
-            let hook = filter.poll_test_hook.take();
-            #[cfg(test)]
-            let snapshot = (snapshot, hook);
-            snapshot
+            (filter.block, filter.kind.clone())
         };
-        #[cfg(test)]
-        let ((start_block, kind, canonical_events), hook) = snapshot;
-        #[cfg(not(test))]
-        let (start_block, kind, canonical_events) = snapshot;
-        #[cfg(test)]
-        if let Some(hook) = hook {
-            hook.snapshot.notify_one();
-            hook.resume.notified().await;
-        }
-        let canonical_events_len = canonical_events.len();
-        let is_log_filter = matches!(&kind, FilterKind::Log(_));
-
+        let (start_block, kind) = snapshot;
         let mut next_block = None;
         let changes = match kind {
             FilterKind::PendingTransaction(filter) => match filter.drain().await {
@@ -348,62 +646,18 @@ where
                 next_block = Some(end_block);
                 FilterChanges::Hashes(block_hashes)
             }
-            FilterKind::Log(filter) => {
-                let mut logs = Vec::new();
-                for notification in &canonical_events {
-                    let reverted = notification.reverted();
-                    let committed = notification.committed();
-                    let blocks = reverted
-                        .iter()
-                        .flat_map(|chain| {
-                            chain
-                                .blocks_and_receipts()
-                                .map(|(block, receipts)| (block, receipts, true))
-                        })
-                        .chain(
-                            committed
-                                .blocks_and_receipts()
-                                .map(|(block, receipts)| (block, receipts, false)),
-                        );
-
-                    for (block, receipts, removed) in blocks {
-                        let block_logs =
-                            reth_rpc_eth_types::logs_utils::matching_block_logs_with_tx_hashes(
-                                self.inner.eth_api.converter(),
-                                &filter,
-                                block.sealed_header(),
-                                block
-                                    .transactions_recovered()
-                                    .zip(receipts.iter())
-                                    .map(|(tx, receipt)| (*tx.tx_hash(), receipt)),
-                                removed,
-                            )
-                            .map_err(|err| {
-                                EthApiError::other(
-                                    Into::<jsonrpsee::types::ErrorObject<'static>>::into(err),
-                                )
-                            })?;
-                        logs.extend(block_logs);
-                    }
-                }
-                FilterChanges::Logs(logs)
-            }
+            FilterKind::Log(_) => unreachable!("log filters are handled by the log-filter actor"),
         };
 
         // Commit only after the response has been built. If this future is cancelled or returns
-        // an error above, queued canonical events remain untouched.
+        // an error above, the cursor remains unchanged.
         let mut filters = self.inner.active_filters.inner.lock().await;
         let filter_is_current =
             filters.get_mut(&id).filter(|filter| Arc::ptr_eq(&filter.poll_lock, &poll_lock));
-        if let Some(filter) = filter_is_current {
-            if let Some(next_block) = next_block {
-                filter.block = next_block;
-            }
-            filter
-                .canonical_events
-                .drain(..canonical_events_len.min(filter.canonical_events.len()));
-        } else if is_log_filter {
-            return Err(EthFilterError::FilterNotFound(id))
+        if let Some(filter) = filter_is_current &&
+            let Some(next_block) = next_block
+        {
+            filter.block = next_block;
         }
         Ok(changes)
     }
@@ -515,7 +769,12 @@ where
     async fn uninstall_filter(&self, id: FilterId) -> RpcResult<bool> {
         trace!(target: "rpc::eth", "Serving eth_uninstallFilter");
         let mut filters = self.inner.active_filters.inner.lock().await;
-        if filters.remove(&id).is_some() {
+        if let Some(filter) = filters.remove(&id) {
+            drop(filters);
+            if matches!(filter.kind, FilterKind::Log(_)) {
+                let _ =
+                    self.inner.log_filter_commands.send(LogFilterCommand::Uninstall(id.clone()));
+            }
             trace!(target: "rpc::eth::filter", ?id, "uninstalled filter");
             Ok(true)
         } else {
@@ -547,9 +806,10 @@ struct EthFilterInner<Eth: EthApiTypes> {
     /// Inner `eth` API implementation.
     eth_api: Eth,
     /// All currently installed filters.
-    active_filters: ActiveFilters<RpcTransaction<Eth::NetworkTypes>, EthPrimitives<Eth>>,
-    /// Sequence assigned when a canonical notification is received.
-    next_canonical_event_id: AtomicU64,
+    active_filters: ActiveFilters<RpcTransaction<Eth::NetworkTypes>>,
+    /// Ordered command stream for installed log filters.
+    log_filter_commands:
+        mpsc::UnboundedSender<LogFilterCommand<EthPrimitives<Eth>, RpcLog<Eth::NetworkTypes>>>,
     /// Provides ids to identify filters
     id_provider: Arc<dyn IdProvider>,
     /// limits for logs queries
@@ -718,6 +978,12 @@ where
         &self,
         kind: FilterKind<RpcTransaction<Eth::NetworkTypes>>,
     ) -> RpcResult<FilterId> {
+        if let FilterKind::Log(filter) = &kind &&
+            has_unsupported_dynamic_block_tag(filter)
+        {
+            return Err(EthFilterError::UnsupportedDynamicBlockTag.into())
+        }
+
         let last_poll_block_number = self.provider().best_block_number().to_rpc_result()?;
         let subscription_id = self.id_provider.next_id();
 
@@ -725,8 +991,11 @@ where
             jsonrpsee_types::SubscriptionId::Num(n) => FilterId::Num(n),
             jsonrpsee_types::SubscriptionId::Str(s) => FilterId::Str(s.into_owned()),
         };
+        let log_filter = match &kind {
+            FilterKind::Log(filter) => Some(filter.clone()),
+            _ => None,
+        };
         let mut filters = self.active_filters.inner.lock().await;
-        let first_canonical_event_id = self.next_canonical_event_id.load(Ordering::SeqCst);
         filters.insert(
             id.clone(),
             ActiveFilter {
@@ -734,12 +1003,32 @@ where
                 poll_lock: Arc::new(Mutex::new(())),
                 last_poll_timestamp: Instant::now(),
                 kind,
-                canonical_events: Vec::new(),
-                first_canonical_event_id,
-                #[cfg(test)]
-                poll_test_hook: None,
             },
         );
+        drop(filters);
+
+        if let Some(filter) = log_filter {
+            let (response, rx) = oneshot::channel();
+            if self
+                .log_filter_commands
+                .send(LogFilterCommand::Install { id: id.clone(), filter, response })
+                .is_err()
+            {
+                self.active_filters.inner.lock().await.remove(&id);
+                return Err(EthFilterError::CanonicalStateStreamClosed.into())
+            }
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    self.active_filters.inner.lock().await.remove(&id);
+                    return Err(err.into())
+                }
+                Err(_) => {
+                    self.active_filters.inner.lock().await.remove(&id);
+                    return Err(EthFilterError::CanonicalStateStreamClosed.into())
+                }
+            }
+        }
         Ok(id)
     }
 
@@ -904,11 +1193,11 @@ where
 
 /// All active filters
 #[derive(Debug, Clone, Default)]
-pub struct ActiveFilters<T, N: NodePrimitives = reth_chain_state::EthPrimitives> {
-    inner: Arc<Mutex<HashMap<FilterId, ActiveFilter<T, N>>>>,
+pub struct ActiveFilters<T> {
+    inner: Arc<Mutex<HashMap<FilterId, ActiveFilter<T>>>>,
 }
 
-impl<T, N: NodePrimitives> ActiveFilters<T, N> {
+impl<T> ActiveFilters<T> {
     /// Returns an empty instance.
     pub fn new() -> Self {
         Self { inner: Arc::new(Mutex::new(HashMap::default())) }
@@ -937,7 +1226,7 @@ impl<T, N: NodePrimitives> ActiveFilters<T, N> {
 
 /// An installed filter
 #[derive(Debug)]
-struct ActiveFilter<T, N: NodePrimitives> {
+struct ActiveFilter<T> {
     /// At which block the filter was polled last.
     block: u64,
     /// Serializes polls so events are consumed only after a response is built successfully.
@@ -946,19 +1235,6 @@ struct ActiveFilter<T, N: NodePrimitives> {
     last_poll_timestamp: Instant,
     /// What kind of filter it is.
     kind: FilterKind<T>,
-    /// Canonical events observed since the previous successful poll.
-    canonical_events: Vec<CanonStateNotification<N>>,
-    /// First canonical event sequence that occurred after this filter was installed.
-    first_canonical_event_id: u64,
-    #[cfg(test)]
-    poll_test_hook: Option<Arc<PollTestHook>>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct PollTestHook {
-    snapshot: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
 }
 
 /// A receiver for pending transactions that returns all new transactions since the last poll.
@@ -1104,6 +1380,9 @@ pub enum EthFilterError {
     /// Invalid block range.
     #[error("invalid block range params")]
     InvalidBlockRangeParams,
+    /// Dynamic block tag cannot be represented by the canonical event stream.
+    #[error("safe, finalized, and pending block tags are not supported for log filters")]
+    UnsupportedDynamicBlockTag,
     /// Block range extends beyond current head.
     #[error("block range extends beyond current head block: requested {requested}, head {head}")]
     BlockRangeExceedsHead {
@@ -1131,6 +1410,9 @@ pub enum EthFilterError {
     /// Error thrown when a spawned task failed to deliver a response.
     #[error("internal filter error")]
     InternalError,
+    /// Canonical state notifications are no longer available.
+    #[error("canonical state notification stream is closed")]
+    CanonicalStateStreamClosed,
 }
 
 impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
@@ -1140,11 +1422,12 @@ impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
                 jsonrpsee::types::error::INVALID_PARAMS_CODE,
                 "filter not found",
             ),
-            err @ EthFilterError::InternalError => {
+            err @ (EthFilterError::InternalError | EthFilterError::CanonicalStateStreamClosed) => {
                 rpc_error_with_code(jsonrpsee::types::error::INTERNAL_ERROR_CODE, err.to_string())
             }
             EthFilterError::EthAPIError(err) => err.into(),
             err @ (EthFilterError::InvalidBlockRangeParams |
+            EthFilterError::UnsupportedDynamicBlockTag |
             EthFilterError::QueryExceedsMaxBlocks(_) |
             EthFilterError::QueryExceedsMaxResults { .. } |
             EthFilterError::BlockRangeExceedsHead { .. }) => {
@@ -2331,6 +2614,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_log_filter_does_not_retain_canonical_chain() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+
+        let chain = test_chain(&[(B256::repeat_byte(1), 1, Address::ZERO, B256::ZERO)]);
+        let weak_chain = Arc::downgrade(&chain);
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit { new: chain.clone() })
+            .await;
+        drop(chain);
+
+        assert!(weak_chain.upgrade().is_none());
+    }
+
+    #[tokio::test]
     async fn test_pure_revert_returns_removed_logs() {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
@@ -2391,7 +2692,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_event_appended_during_poll_is_returned_by_next_poll() {
+    async fn test_event_appended_after_poll_is_returned_by_next_poll() {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
@@ -2406,32 +2707,17 @@ mod tests {
             })
             .await;
 
-        let hook = Arc::new(PollTestHook::default());
-        eth_filter
-            .inner
-            .active_filters
-            .inner
-            .lock()
-            .await
-            .get_mut(&filter_id)
-            .unwrap()
-            .poll_test_hook = Some(hook.clone());
-        let poll_filter = eth_filter.clone();
-        let poll_id = filter_id.clone();
-        let poll = tokio::spawn(async move { poll_filter.filter_changes(poll_id).await });
-        hook.snapshot.notified().await;
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id.clone()).await.unwrap()
+        else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.iter().map(|log| log.block_hash).collect::<Vec<_>>(), [Some(first_hash)]);
 
         eth_filter
             .queue_canonical_state(CanonStateNotification::Commit {
                 new: test_chain(&[(second_hash, 2, Address::ZERO, B256::ZERO)]),
             })
             .await;
-        hook.resume.notify_one();
-
-        let FilterChanges::Logs(logs) = poll.await.unwrap().unwrap() else {
-            panic!("expected log changes")
-        };
-        assert_eq!(logs.iter().map(|log| log.block_hash).collect::<Vec<_>>(), [Some(first_hash)]);
         let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
             panic!("expected log changes")
         };
@@ -2453,24 +2739,12 @@ mod tests {
             })
             .await;
 
-        let hook = Arc::new(PollTestHook::default());
-        eth_filter
-            .inner
-            .active_filters
-            .inner
-            .lock()
-            .await
-            .get_mut(&filter_id)
-            .unwrap()
-            .poll_test_hook = Some(hook.clone());
         let first_filter = eth_filter.clone();
         let first_id = filter_id.clone();
         let first = tokio::spawn(async move { first_filter.filter_changes(first_id).await });
-        hook.snapshot.notified().await;
         let second_filter = eth_filter.clone();
         let second_id = filter_id.clone();
         let second = tokio::spawn(async move { second_filter.filter_changes(second_id).await });
-        hook.resume.notify_one();
 
         let FilterChanges::Logs(first_logs) = first.await.unwrap().unwrap() else {
             panic!("expected log changes")
@@ -2478,13 +2752,49 @@ mod tests {
         let FilterChanges::Logs(second_logs) = second.await.unwrap().unwrap() else {
             panic!("expected log changes")
         };
-        assert_eq!(first_logs.len(), 1);
-        assert_eq!(first_logs[0].block_hash, Some(block_hash));
-        assert!(second_logs.is_empty());
+        let mut lengths = [first_logs.len(), second_logs.len()];
+        lengths.sort_unstable();
+        assert_eq!(lengths, [0, 1]);
+        assert_eq!(
+            first_logs.iter().chain(&second_logs).next().unwrap().block_hash,
+            Some(block_hash)
+        );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_invalidated_filter_fails_in_flight_poll() {
+    #[tokio::test]
+    async fn test_cancelled_poll_restores_logs() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        let block_hash = B256::repeat_byte(1);
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(block_hash, 1, Address::ZERO, B256::ZERO)]),
+            })
+            .await;
+
+        let (response, rx) = oneshot::channel();
+        eth_filter
+            .inner
+            .log_filter_commands
+            .send(LogFilterCommand::Poll { id: filter_id.clone(), response })
+            .unwrap();
+        let delivery = rx.await.unwrap().unwrap();
+        drop(delivery);
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_hash, Some(block_hash));
+    }
+
+    #[tokio::test]
+    async fn test_invalidated_filter_fails_next_poll() {
         let provider = MockEthProvider::default();
         provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
         let eth_api = build_test_eth_api(provider);
@@ -2497,25 +2807,10 @@ mod tests {
             })
             .await;
 
-        let hook = Arc::new(PollTestHook::default());
-        eth_filter
-            .inner
-            .active_filters
-            .inner
-            .lock()
-            .await
-            .get_mut(&filter_id)
-            .unwrap()
-            .poll_test_hook = Some(hook.clone());
-        let poll_filter = eth_filter.clone();
-        let poll_id = filter_id.clone();
-        let poll = tokio::spawn(async move { poll_filter.filter_changes(poll_id).await });
-        hook.snapshot.notified().await;
-        eth_filter.inner.active_filters.inner.lock().await.remove(&filter_id);
-        hook.resume.notify_one();
+        eth_filter.invalidate_log_filters().await;
 
         assert!(matches!(
-            poll.await.unwrap(),
+            eth_filter.filter_changes(filter_id.clone()).await,
             Err(EthFilterError::FilterNotFound(id)) if id == filter_id
         ));
     }
@@ -2553,6 +2848,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_filter_installed_after_invalidation_remains_valid() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let old = eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+
+        eth_filter.invalidate_log_filters().await;
+        let new = eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+
+        assert!(!eth_filter.active_filters().contains(&old).await);
+        assert!(eth_filter.active_filters().contains(&new).await);
+    }
+
+    #[tokio::test]
+    async fn test_closed_canonical_stream_invalidates_and_rejects_log_filters() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        let (notifications, receiver) = tokio::sync::broadcast::channel(1);
+        drop(notifications);
+
+        eth_filter.watch_canonical_state(receiver).await;
+
+        assert!(!eth_filter.active_filters().contains(&filter_id).await);
+        assert!(eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_log_filter_backlog_limit_invalidates_filter() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let config = EthFilterConfig::default().max_logs_per_response(1);
+        let eth_filter = EthFilter::new(eth_api, config, Runtime::test());
+        let filter_id =
+            eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[
+                    (B256::repeat_byte(1), 1, Address::ZERO, B256::ZERO),
+                    (B256::repeat_byte(2), 2, Address::ZERO, B256::ZERO),
+                ]),
+            })
+            .await;
+
+        assert!(matches!(
+            eth_filter.filter_changes(filter_id.clone()).await,
+            Err(EthFilterError::FilterNotFound(id)) if id == filter_id
+        ));
+    }
+
+    #[tokio::test]
     async fn test_filter_ignores_canonical_event_received_before_installation() {
         use reth_execution_types::Chain;
 
@@ -2567,19 +2919,74 @@ mod tests {
         let eth_api = build_test_eth_api(provider);
         let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
 
-        // Reserve the sequence before installing the filter, as if the watcher had received the
-        // notification and were waiting for the active-filter lock.
-        let event_id = eth_filter.inner.next_canonical_event_id.fetch_add(1, Ordering::SeqCst);
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: Arc::new(Chain::default()),
+            })
+            .await;
         let filter_id =
             eth_filter.inner.install_filter(FilterKind::Log(Box::default())).await.unwrap();
+        assert!(matches!(
+            eth_filter.filter_changes(filter_id).await.unwrap(),
+            FilterChanges::Logs(logs) if logs.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_log_filters_reject_unresolved_dynamic_block_tags() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+
+        for tag in [BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized, BlockNumberOrTag::Pending]
+        {
+            for filter in [Filter::new().from_block(tag), Filter::new().to_block(tag)] {
+                let err = eth_filter
+                    .inner
+                    .install_filter(FilterKind::Log(Box::new(filter)))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+            }
+        }
+
         eth_filter
-            .queue_canonical_state_at(
-                event_id,
-                CanonStateNotification::Commit { new: Arc::new(Chain::default()) },
-            )
+            .inner
+            .install_filter(FilterKind::Log(Box::new(
+                Filter::new()
+                    .from_block(BlockNumberOrTag::Latest)
+                    .to_block(BlockNumberOrTag::Latest),
+            )))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_log_filter_to_earliest_matches_block_zero() {
+        let provider = MockEthProvider::default();
+        provider.add_block(B256::ZERO, reth_ethereum_primitives::Block::default());
+        let eth_api = build_test_eth_api(provider);
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let filter_id = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(
+                Filter::new().to_block(BlockNumberOrTag::Earliest),
+            )))
+            .await
+            .unwrap();
+        let block_hash = B256::repeat_byte(1);
+
+        eth_filter
+            .queue_canonical_state(CanonStateNotification::Commit {
+                new: test_chain(&[(block_hash, 0, Address::ZERO, B256::ZERO)]),
+            })
             .await;
 
-        let filters = eth_filter.inner.active_filters.inner.lock().await;
-        assert!(filters.get(&filter_id).unwrap().canonical_events.is_empty());
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(filter_id).await.unwrap() else {
+            panic!("expected log changes")
+        };
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_hash, Some(block_hash));
     }
 }
