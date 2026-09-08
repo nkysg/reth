@@ -65,12 +65,12 @@ pub struct ProofCalculator<TC, HC, VE: LeafValueEncoder> {
     /// and so on. When a branch is removed from `branch_stack` its children are removed from this
     /// one, and the branch is pushed onto this stack in their place (see [`Self::pop_branch`].
     ///
-    /// Children on the `child_stack` are converted to [`ProofTrieBranchChild::RlpNode`]s via the
-    /// [`Self::commit_child`] method. Committing a child indicates that no further changes are
-    /// expected to happen to it (e.g. splitting its short key when inserting a new branch). Given
-    /// that keys are consumed in lexicographical order, only the last child on the stack can
-    /// ever be modified, and therefore all children besides the last are expected to be
-    /// [`ProofTrieBranchChild::RlpNode`]s.
+    /// Given that keys are consumed in lexicographical order, only the last child on the stack
+    /// can still require structural changes (e.g. splitting its short key when inserting a new
+    /// branch). Once a child is finalized, [`Self::commit_last_child`] converts it to a
+    /// [`ProofTrieBranchChild::RlpNode`] if retained for the proof. Unretained children can remain
+    /// unencoded anywhere on the stack until [`Self::pop_branch`], giving deferred encoders more
+    /// time for async work.
     child_stack: Vec<ProofTrieBranchChild<VE::DeferredEncoder>>,
     /// Cached branch data pulled from the `trie_cursor`. The calculator will use the cached
     /// [`BranchNodeCompact::hashes`] to skip over the calculation of sub-tries in the overall
@@ -253,13 +253,15 @@ where
     }
 
     /// Takes a child which has been removed from the `child_stack` and converts it to an
-    /// [`RlpNode`].
+    /// [`RlpNode`], retaining it as a proof node.
     ///
-    /// Calling this method indicates that the child will not undergo any further modifications, and
-    /// therefore can be retained as a proof node if applicable.
-    fn commit_child<'a>(
+    /// Calling this method indicates that the child will not undergo any further modifications.
+    ///
+    /// The caller has already determined via [`Self::should_retain`] that this child is retained.
+    /// That decision must not be re-evaluated here, because `should_retain` advances the `targets`
+    /// cursor. Children which are not retained are converted later, in [`Self::pop_branch`].
+    fn commit_child(
         &mut self,
-        targets: &mut Option<TargetsCursor<'a>>,
         child_path: Nibbles,
         child: ProofTrieBranchChild<VE::DeferredEncoder>,
     ) -> Result<RlpNode, StateProofError> {
@@ -269,38 +271,22 @@ where
             return child.into_rlp(&mut self.rlp_encode_buf).map(|(node, _)| node)
         }
 
-        // If we should retain the child then do so.
-        if self.should_retain(targets, &child_path, true) {
-            trace!(target: TRACE_TARGET, ?child_path, "Retaining child");
+        trace!(target: TRACE_TARGET, ?child_path, "Retaining child");
 
-            // Convert to `ProofTrieNodeV2`, which will be what is retained.
-            //
-            // If this node is a branch then its `rlp_nodes_buf` will be taken and not returned to
-            // the `rlp_nodes_bufs` free-list.
-            self.rlp_encode_buf.clear();
-            let proof_node = child.into_proof_trie_node(child_path, &mut self.rlp_encode_buf)?;
-
-            // Use the `ProofTrieNodeV2` to encode the `RlpNode`, and then push it onto retained
-            // nodes before returning.
-            self.rlp_encode_buf.clear();
-            proof_node.node.encode(&mut self.rlp_encode_buf);
-
-            self.retained_proofs.push(proof_node);
-            return Ok(RlpNode::from_rlp(&self.rlp_encode_buf));
-        }
-
-        // If the child path is not being retained then we convert directly to an `RlpNode`
-        // using `into_rlp`. Since we are not retaining the node we can recover any `RlpNode`
-        // buffers for the free-list here, hence why we do this as a separate logical branch.
+        // Convert to `ProofTrieNodeV2`, which will be what is retained.
+        //
+        // If this node is a branch then its `rlp_nodes_buf` will be taken and not returned to the
+        // `rlp_nodes_bufs` free-list.
         self.rlp_encode_buf.clear();
-        let (child_rlp_node, freed_rlp_nodes_buf) = child.into_rlp(&mut self.rlp_encode_buf)?;
+        let proof_node = child.into_proof_trie_node(child_path, &mut self.rlp_encode_buf)?;
 
-        // If there is an `RlpNode` buffer which can be re-used then push it onto the free-list.
-        if let Some(buf) = freed_rlp_nodes_buf {
-            self.rlp_nodes_bufs.push(buf);
-        }
+        // Use the `ProofTrieNodeV2` to encode the `RlpNode`, and then push it onto retained nodes
+        // before returning.
+        self.rlp_encode_buf.clear();
+        proof_node.node.encode(&mut self.rlp_encode_buf);
 
-        Ok(child_rlp_node)
+        self.retained_proofs.push(proof_node);
+        Ok(RlpNode::from_rlp(&self.rlp_encode_buf))
     }
 
     /// Returns the path of the child of the currently under-construction branch at the given
@@ -336,8 +322,9 @@ where
             .then(|| self.child_path_at(Self::highest_set_nibble(branch.state_mask)))
     }
 
-    /// Calls [`Self::commit_child`] on the last child of `child_stack`, replacing it with a
-    /// [`ProofTrieBranchChild::RlpNode`].
+    /// If the last child of `child_stack` is retained for the proof, calls [`Self::commit_child`]
+    /// to replace it with a [`ProofTrieBranchChild::RlpNode`]. Otherwise, leaves it unencoded until
+    /// [`Self::pop_branch`].
     ///
     /// If `child_stack` is empty then this is a no-op.
     ///
@@ -368,7 +355,7 @@ where
         // to pop_branch() to give DeferredEncoder time for async work.
         if self.should_retain(targets, &child_path, true) {
             let (hash_mask_bit, tree_mask_bit) = child.mask_bits();
-            let child_rlp_node = self.commit_child(targets, child_path, child)?;
+            let child_rlp_node = self.commit_child(child_path, child)?;
             trace!(target: TRACE_TARGET, ?child_rlp_node, "Pushing committed child RlpNode onto stack");
             self.child_stack.push(ProofTrieBranchChild::RlpNode {
                 node: child_rlp_node,
@@ -448,14 +435,15 @@ where
             // Store the child key relative to its new parent branch.
             child.trim_short_key_prefix(path.len() - short_key.len());
 
-            // Commit the preceding child before pushing this one, so only the final child on the
-            // stack can remain uncommitted.
+            // The preceding child is structurally final. Commit it if retained for the proof;
+            // otherwise its encoding can wait until pop_branch.
             self.commit_last_child(targets)?;
 
             let branch = self.branch_stack.last_mut().expect("branch_stack cannot be empty");
             debug_assert!(!branch.state_mask.is_bit_set(nibble));
 
-            // Mark the nibble occupied now that the preceding child has been committed.
+            // Set the new child's bit after commit_last_child, which uses the mask to find the
+            // preceding child's path.
             branch.state_mask.set_bit(nibble);
 
             // The parent now contains this child at `nibble`.
@@ -548,8 +536,8 @@ where
             "called",
         );
 
-        // Ensure the final child on the child stack has been committed, as this method expects all
-        // children of the branch to have been committed.
+        // Retain the final child if needed before draining the branch's children. Unretained
+        // children are encoded below.
         self.commit_last_child(targets)?;
 
         let mut rlp_nodes_buf = self.take_rlp_nodes_buf();
